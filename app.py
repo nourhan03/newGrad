@@ -8,9 +8,52 @@ import urllib.parse
 import os
 import logging
 import atexit
-from resources import *
-from services import *
-from scheduler import *
+from resources import (
+    EnrollmentPeriodResource,
+    CurrentEnrollmentPeriodResource,
+    SmartRecommendationsResource,
+    MandatoryCoursesRecommendationResource,
+    ElectiveCoursesRecommendationResource,
+    FailedCoursesRetryRecommendationResource,
+    GPAImprovementRecommendationResource,
+    MissedMandatoryCoursesResource,
+    FutureMandatoryCoursesResource,
+    CourseEnrollmentResource,
+    CourseEnrollmentCancellationResource,
+    CourseEnrollmentHardDeleteResource,
+    StudentEnrollmentStatusResource,
+    GraduationEligibilityResource,
+    GraduationSummaryResource,
+    AcademicWarningResource,
+    ResolveWarningResource,
+    WarningStatsResource,
+    StudentWarningCheckResource,
+    StudentWarningResolveResource,
+    AcademicStatusAnalysisResource,
+    StudentBasicInfoResource,
+    GPAAnalysisResource,
+    PerformancePatternsResource,
+    RiskAssessmentResource,
+    CourseAnalysisResource,
+    AttendanceAnalysisResource,
+    AcademicWarningsSummaryResource,
+    PeerComparisonResource,
+    PredictionsResource,
+    InterventionsResource, 
+    AcademicPathPlanningResource,
+    PathRecommendationResource,
+    StudentPathProgressResource,
+    PathValidationResource,
+    DivisionTransitionResource,
+    VerySmartAcademicPathPlanningResource,
+    SmartPathAnalysisResource,
+    AcademicSmartRecommendationsResource,
+    StudentPerformancePredictionResource,
+    AIInsightsResource
+    
+)
+
+from scheduler import AcademicWarningScheduler
 # إعداد التسجيل
 logging.basicConfig(
     level=logging.INFO,
