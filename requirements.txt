@@ -1,0 +1,16 @@
+Flask
+Flask-SocketIO
+eventlet
+gunicorn
+Flask-RESTful
+Flask-Cors
+Flask-SQLAlchemy
+Flask-APScheduler
+python-dotenv
+SQLAlchemy
+Werkzeug
+psycopg2-binary
+pyodbc
+numpy
+pandas
+scikit-learn
