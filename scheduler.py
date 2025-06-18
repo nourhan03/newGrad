@@ -1,5 +1,5 @@
 from datetime import datetime, timedelta
-from .services import AcademicWarningService
+from services import AcademicWarningService
 import logging
 
 logger = logging.getLogger(__name__)
