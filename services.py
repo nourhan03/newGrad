@@ -1,74 +1,171 @@
 from datetime import datetime
-from sqlalchemy import func, and_
+from sqlalchemy import func, and_, or_
 from extensions import db
-from models import Students, Divisions, Enrollments, Courses, CourseDivisions, Departments,Professors
+from models import (
+    Students, Divisions, Enrollments, Courses, CourseDivisions, Departments,
+    AcademicWarnings, Attendances, EnrollmentPeriods, CoursePrerequisites, Classes, Professors
+)
+
+from functools import lru_cache
+import time
+from sqlalchemy.orm import joinedload, selectinload
 from typing import Dict, List, Any, Optional
 from datetime import datetime, timedelta
 import statistics
 import numpy as np
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
 from sklearn.linear_model import LinearRegression
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.preprocessing import StandardScaler
 import pandas as pd
-
-from models import (
-    Students, Enrollments, Courses, AcademicWarnings, 
-    Attendances, Divisions, db
-)
-
-from datetime import datetime, timedelta
-from sqlalchemy import and_, or_, func
-from extensions import db
-from models import Students, Enrollments, Courses, AcademicWarnings
-import logging
-from models import Students, Courses, Enrollments, EnrollmentPeriods, CourseDivisions, CoursePrerequisites
 import logging
 
 logger = logging.getLogger(__name__)
 
-from models import EnrollmentPeriods
+
+
 
 
 
 class GraduationEligibilityService:
     
-    # ثوابت النظام الأكاديمي
+   
     TOTAL_REQUIRED_CREDITS = 136
     MANDATORY_CREDITS = 96
     ELECTIVE_CREDITS = 40
     MINIMUM_GPA = 2.0
     
-    # تصنيف السنوات الدراسية
     YEAR_CLASSIFICATIONS = {
         1: (0, 33),    
         2: (34, 67),    
-        3: (68, 101),  # السنة الثالثة
-        4: (102, 136)  # السنة الرابعة
+        3: (68, 101),  
+        4: (102, 136)  
     }
     
-    # المسارات الأكاديمية
     ACADEMIC_TRACKS = {
         "العلوم الطبيعية": {
-            "year_1": [1030],  # مجموعة العلوم الطبيعية
-            "year_2": [1035, 1095],  # الرياضيات والفيزياء، الكيمياء والفيزياء
+            "year_1": [1030],  
+            "year_2": [1035, 1095],  
             "year_3_4_math_physics": [1040, 1045, 1035, 1050],
             "year_3_4_chem_physics": [1055, 1095]
         },
         "العلوم البيولوجية": {
-            "year_1_2": [1085],  # مجموعة العلوم البيولوجية والكيميائية
+            "year_1_2": [1085],  
             "year_3_4": [1060, 1065, 1070, 1075]
         },
         "العلوم الجيولوجية": {
-            "year_1_2": [1090],  # مجموعة العلوم الجيولوجية والكيميائية
+            "year_1_2": [1090],  
             "year_3_4": [1080]
+        }
+    }
+
+    # نظام التشعيب الأكاديمي المحدث
+    DIVISION_SYSTEM = {
+        # أكواد الشعب وما يقابلها من مسارات
+        '1030': {
+            'path': 'العلوم الطبيعية', 
+            'stage': 'السنة الأولى', 
+            'level': 1,
+            'next_options': ['1035', '1095'],
+            'description': 'مجموعة العلوم الطبيعية'
+        },
+        '1035': {
+            'path': 'العلوم الطبيعية', 
+            'stage': 'السنة الثانية', 
+            'level': 2,
+            'next_options': ['1040', '1045', '1035', '1050'],
+            'description': 'الرياضيات والفيزياء'
+        },
+        '1095': {
+            'path': 'العلوم الطبيعية', 
+            'stage': 'السنة الثانية', 
+            'level': 2,
+            'next_options': ['1055', '1095'],
+            'description': 'الكيمياء والفيزياء'
+        },
+        '1040': {
+            'path': 'العلوم الطبيعية', 
+            'stage': 'السنة الثالثة والرابعة', 
+            'level': 3,
+            'next_options': [],
+            'description': 'الرياضيات الخاصة'
+        },
+        '1045': {
+            'path': 'العلوم الطبيعية', 
+            'stage': 'السنة الثالثة والرابعة', 
+            'level': 3,
+            'next_options': [],
+            'description': 'الفيزياء الخاصة'
+        },
+        '1050': {
+            'path': 'العلوم الطبيعية', 
+            'stage': 'السنة الثالثة والرابعة', 
+            'level': 3,
+            'next_options': [],
+            'description': 'الرياضيات وعلوم الحاسب'
+        },
+        '1055': {
+            'path': 'العلوم الطبيعية', 
+            'stage': 'السنة الثالثة والرابعة', 
+            'level': 3,
+            'next_options': [],
+            'description': 'الكيمياء الخاصة'
+        },
+        '1085': {
+            'path': 'العلوم البيولوجية', 
+            'stage': 'السنة الأولى والثانية', 
+            'level': 1,
+            'next_options': ['1060', '1065', '1070', '1075'],
+            'description': 'مجموعة العلوم البيولوجية والكيميائية'
+        },
+        '1060': {
+            'path': 'العلوم البيولوجية', 
+            'stage': 'السنة الثالثة والرابعة', 
+            'level': 3,
+            'next_options': [],
+            'description': 'علم الحيوان'
+        },
+        '1065': {
+            'path': 'العلوم البيولوجية', 
+            'stage': 'السنة الثالثة والرابعة', 
+            'level': 3,
+            'next_options': [],
+            'description': 'النبات والكيمياء'
+        },
+        '1070': {
+            'path': 'العلوم البيولوجية', 
+            'stage': 'السنة الثالثة والرابعة', 
+            'level': 3,
+            'next_options': [],
+            'description': 'علم الحيوان والكيمياء'
+        },
+        '1075': {
+            'path': 'العلوم البيولوجية', 
+            'stage': 'السنة الثالثة والرابعة', 
+            'level': 3,
+            'next_options': [],
+            'description': 'الكيمياء والكيمياء الحيوية'
+        },
+        '1090': {
+            'path': 'العلوم الجيولوجية', 
+            'stage': 'السنة الأولى والثانية', 
+            'level': 1,
+            'next_options': ['1080'],
+            'description': 'مجموعة العلوم الجيولوجية والكيميائية'
+        },
+        '1080': {
+            'path': 'العلوم الجيولوجية', 
+            'stage': 'السنة الثالثة والرابعة', 
+            'level': 3,
+            'next_options': [],
+            'description': 'الجيولوجيا والكيمياء'
         }
     }
 
     @classmethod
     def get_graduation_eligibility(cls, student_id):
-        """الحصول على تقرير أهلية التخرج الشامل"""
         try:
-            # الحصول على بيانات الطالب
             student = Students.query.get(student_id)
             if not student:
                 return {
@@ -77,18 +174,14 @@ class GraduationEligibilityService:
                     
                 }
             
-            # معلومات الطالب
             student_info = cls._get_student_info(student)
             
-            # حساب المعدل التراكمي
             cumulative_gpa = cls._calculate_gpa(student_id)
             
-            # الحصول على المواد والساعات
             completed_courses = cls._get_completed_courses(student_id)
             failed_courses = cls._get_failed_courses(student_id)
             remaining_courses = cls._get_remaining_courses(student_id, student.DivisionId)
             
-            # تحليل الساعات مع تمرير الساعات الفعلية للطالب
             credits_analysis = cls._analyze_credits(
                 completed_courses, 
                 remaining_courses, 
@@ -96,25 +189,20 @@ class GraduationEligibilityService:
                 student.CreditsCompleted
             )
             
-            # تحليل المعدل
             gpa_analysis = cls._analyze_gpa(cumulative_gpa)
             
-            # الإنذارات الأكاديمية
             warnings = cls._get_academic_warnings(student_id)
             
-            # تحديد حالة التخرج
             graduation_status = cls._determine_graduation_status(
                 credits_analysis, cumulative_gpa, warnings
             )
             
-            # التخطيط للتخرج
             graduation_planning = cls._calculate_graduation_planning(
                 credits_analysis, student_info["current_semester"]
             )
             
-            # التوصيات
             recommendations = cls._generate_recommendations(
-                graduation_status, credits_analysis, gpa_analysis, remaining_courses
+                graduation_status, credits_analysis, gpa_analysis, remaining_courses, student_info
             )
             
             return {
@@ -143,49 +231,84 @@ class GraduationEligibilityService:
 
     @staticmethod
     def _get_student_info(student):
-        """الحصول على معلومات الطالب الأساسية"""
-        # استخدام StudentLevel الموجود في الجدول
         academic_year = student.StudentLevel or 1
         
-        # الحصول على معلومات الشعبة
         division = Divisions.query.get(student.DivisionId)
         division_name = division.Name if division else "غير محدد"
+        
+        # تحديد مرحلة الطالب الأكاديمية
+        academic_stage_info = GraduationEligibilityService._determine_academic_stage(student)
         
         return {
             "id": student.Id,
             "name": student.Name,
             "division": division_name,
+            "division_code": str(student.DivisionId),
             "current_semester": student.Semester,
             "academic_year": academic_year,
             "status": student.status,
-            "credits_completed": student.CreditsCompleted
+            "credits_completed": student.CreditsCompleted,
+            "academic_stage": academic_stage_info
         }
 
     @staticmethod
-    def _analyze_credits(completed_courses, remaining_courses, division_id, actual_credits=None):
-        """تحليل الساعات المكتملة والمتبقية مع مراعاة البيانات الناقصة"""
+    def _determine_academic_stage(student):
+        """تحديد مرحلة الطالب الأكاديمية والمواد المطلوبة"""
+        division_code = str(student.DivisionId)
+        current_semester = student.Semester
         
-        # حساب الساعات من المواد المسجلة
+        # التحقق من وجود الشعبة في النظام
+        if division_code not in GraduationEligibilityService.DIVISION_SYSTEM:
+            return {
+                "stage": "غير محدد",
+                "specialization_status": "غير معروف",
+                "can_choose_specialization": False,
+                "available_options": [],
+                "message": "شعبة غير مسجلة في النظام"
+            }
+        
+        division_info = GraduationEligibilityService.DIVISION_SYSTEM[division_code]
+        
+        # تحديد حالة التخصص بناءً على نوع الشعبة
+        if division_info['level'] == 1:  # شعب عامة (يمكن اختيار تخصص منها)
+            can_choose = current_semester >= 3  # يمكن الاختيار من الترم 3
+            
+            return {
+                "stage": division_info['stage'],
+                "path": division_info['path'],
+                "specialization_status": "لم يتم اختيار التخصص النهائي بعد",
+                "can_choose_specialization": can_choose,
+                "available_options": division_info['next_options'],
+                "message": f"الطالب في {division_info['description']} - يمكن اختيار التخصص النهائي"
+            }
+        else:  # شعب متخصصة (تخصص نهائي)
+            return {
+                "stage": division_info['stage'],
+                "path": division_info['path'],
+                "specialization_status": "في التخصص النهائي",
+                "can_choose_specialization": False,
+                "available_options": [],
+                "message": f"الطالب في تخصص {division_info['description']}"
+            }
+
+    @staticmethod
+    def _analyze_credits(completed_courses, remaining_courses, division_id, actual_credits=None):
+        
         calculated_credits = sum(course["credits"] for course in completed_courses)
         
-        # استخدام الساعات الفعلية إذا كانت متوفرة وأكبر من المحسوبة
         if actual_credits and actual_credits > calculated_credits:
             completed_credits = actual_credits
             data_source = "ملف الطالب (بيانات مكتملة)"
-            # تقدير توزيع الساعات بناءً على النسب المعتادة
             estimated_mandatory = min(GraduationEligibilityService.MANDATORY_CREDITS, int(actual_credits * 0.75))
             estimated_elective = actual_credits - estimated_mandatory
         else:
             completed_credits = calculated_credits
             data_source = "المواد المسجلة"
-            # حساب دقيق من المواد المسجلة
             estimated_mandatory = GraduationEligibilityService._calculate_mandatory_credits(completed_courses)
             estimated_elective = completed_credits - estimated_mandatory
         
-        # المواد المتبقية
         remaining_credits = sum(course["credits"] for course in remaining_courses)
         
-        # حساب الساعات الإجبارية والاختيارية المتبقية
         mandatory_remaining = 0
         elective_remaining = 0
         
@@ -195,14 +318,11 @@ class GraduationEligibilityService:
             else:
                 elective_remaining += course["credits"]
         
-        # تعديل الحسابات بناءً على الساعات الفعلية المكتملة
         actual_mandatory_remaining = max(0, GraduationEligibilityService.MANDATORY_CREDITS - estimated_mandatory)
         actual_elective_remaining = max(0, GraduationEligibilityService.ELECTIVE_CREDITS - estimated_elective)
         
-        # إجمالي الساعات المتبقية للتخرج
         total_remaining = max(0, GraduationEligibilityService.TOTAL_REQUIRED_CREDITS - completed_credits)
         
-        # حساب نسبة الإنجاز
         completion_percentage = (completed_credits / GraduationEligibilityService.TOTAL_REQUIRED_CREDITS) * 100
         
         return {
@@ -226,12 +346,9 @@ class GraduationEligibilityService:
 
     @staticmethod
     def _calculate_mandatory_credits(completed_courses):
-        """حساب الساعات الإجبارية المكتملة"""
         try:
-            # حساب الساعات الإجبارية من المواد المكتملة
             mandatory_credits = 0
             for course in completed_courses:
-                # التحقق من كون المادة إجبارية
                 course_division = db.session.query(CourseDivisions).filter(
                     CourseDivisions.CourseId == course["id"],
                     CourseDivisions.IsMandatory == True
@@ -248,14 +365,10 @@ class GraduationEligibilityService:
 
     @staticmethod
     def _analyze_courses(student_id, division_id):
-        """تحليل المواد المكتملة والمتبقية"""
-        # المواد المكتملة
         completed_courses = GraduationEligibilityService._get_completed_courses(student_id)
         
-        # المواد المتبقية
         remaining_courses = GraduationEligibilityService._get_remaining_courses(student_id, division_id)
         
-        # المواد الراسبة
         failed_courses = GraduationEligibilityService._get_failed_courses(student_id)
         
         return {
@@ -266,7 +379,6 @@ class GraduationEligibilityService:
 
     @staticmethod
     def _get_completed_courses(student_id):
-        """الحصول على المواد المكتملة"""
         try:
             completed = db.session.query(Enrollments, Courses).join(
                 Courses, Enrollments.CourseId == Courses.Id
@@ -296,49 +408,112 @@ class GraduationEligibilityService:
 
     @staticmethod
     def _get_remaining_courses(student_id, division_id):
-        """الحصول على المواد المتبقية مع تحديد نوعها وحالة توفرها"""
         try:
-            # الحصول على المواد المكتملة والمسجل فيها حالياً
+            student = Students.query.get(student_id)
+            if not student:
+                return []
+                
+            # تحديد مرحلة الطالب الأكاديمية
+            academic_stage = GraduationEligibilityService._determine_academic_stage(student)
+            
             enrolled_course_ids = db.session.query(Enrollments.CourseId).filter(
                 Enrollments.StudentId == student_id,
                 Enrollments.IsCompleted.in_(["مكتملة", "قيد الدراسة"])
             ).subquery()
             
-            # الحصول على جميع مواد الشعبة التي لم يتم التسجيل فيها أو إكمالها
-            division_courses = db.session.query(Courses).join(
-                CourseDivisions, Courses.Id == CourseDivisions.CourseId
-            ).filter(
-                CourseDivisions.DivisionId == division_id,
-                ~Courses.Id.in_(enrolled_course_ids)
-            ).all()
-            
             remaining_courses = []
-            for course in division_courses:
-                # تحديد نوع المادة
-                division_course = db.session.query(CourseDivisions).filter(
+            
+            # إذا كان الطالب لم يختر تخصص نهائي بعد
+            if academic_stage["specialization_status"] in ["لم يتم اختيار التخصص النهائي بعد", "يجب اختيار التخصص فوراً"]:
+                # عرض المواد الحالية للشعبة الموجود فيها
+                current_division_courses = db.session.query(Courses).join(
+                    CourseDivisions, Courses.Id == CourseDivisions.CourseId
+                ).filter(
                     CourseDivisions.DivisionId == division_id,
-                    CourseDivisions.CourseId == course.Id
-                ).first()
+                    ~Courses.Id.in_(enrolled_course_ids)
+                ).all()
                 
-                course_type = "إجبارية" if division_course and division_course.IsMandatory else "اختيارية"
+                for course in current_division_courses:
+                    division_course = db.session.query(CourseDivisions).filter(
+                        CourseDivisions.DivisionId == division_id,
+                        CourseDivisions.CourseId == course.Id
+                    ).first()
+                    
+                    course_type = "إجبارية" if division_course and division_course.IsMandatory else "اختيارية"
+                    is_available = course.Status == "متاح"
+                    availability_status = "متاحة للتسجيل" if is_available else "غير متاحة حالياً"
+                    prerequisites = GraduationEligibilityService._get_course_prerequisites(course.Id, student_id)
+                    
+                    remaining_courses.append({
+                        "id": course.Id,
+                        "name": course.Name,
+                        "code": course.Code,
+                        "credits": course.Credits,
+                        "type": course_type,
+                        "availability_status": availability_status,
+                        "prerequisites": prerequisites,
+                        "semester": course.Semester,
+                        "category": "مواد الشعبة الحالية"
+                    })
                 
-                # التحقق من حالة توفر المادة من جدول Courses
-                is_available = course.Status == "متاح"
-                availability_status = "متاحة للتسجيل" if is_available else "غير متاحة حالياً"
+                # إضافة معلومات عن التخصصات المتاحة
+                if academic_stage["available_options"]:
+                    available_specializations = []
+                    for option_code in academic_stage["available_options"]:
+                        if option_code in GraduationEligibilityService.DIVISION_SYSTEM:
+                            spec_info = GraduationEligibilityService.DIVISION_SYSTEM[option_code]
+                            available_specializations.append({
+                                "code": option_code,
+                                "name": spec_info["description"],
+                                "path": spec_info["path"],
+                                "stage": spec_info["stage"]
+                            })
+                    
+                    # إضافة معلومة خاصة عن التخصصات المتاحة
+                    remaining_courses.append({
+                        "id": "SPECIALIZATION_INFO",
+                        "name": "اختيار التخصص",
+                        "code": "SPEC",
+                        "credits": 0,
+                        "type": "معلومات",
+                        "availability_status": "متاح للاختيار" if academic_stage["can_choose_specialization"] else "غير متاح بعد",
+                        "prerequisites": "إنهاء متطلبات الشعبة الحالية",
+                        "semester": 0,
+                        "category": "تخصصات متاحة",
+                        "available_specializations": available_specializations
+                    })
+            
+            else:
+                # الطالب في تخصص نهائي - عرض المواد العادية
+                division_courses = db.session.query(Courses).join(
+                    CourseDivisions, Courses.Id == CourseDivisions.CourseId
+                ).filter(
+                    CourseDivisions.DivisionId == division_id,
+                    ~Courses.Id.in_(enrolled_course_ids)
+                ).all()
                 
-                # التحقق من المتطلبات السابقة
-                prerequisites = GraduationEligibilityService._get_course_prerequisites(course.Id, student_id)
-                
-                remaining_courses.append({
-                    "id": course.Id,
-                    "name": course.Name,
-                    "code": course.Code,
-                    "credits": course.Credits,
-                    "type": course_type,
-                    "availability_status": availability_status,
-                    "prerequisites": prerequisites,
-                    "semester": course.Semester,
-                })
+                for course in division_courses:
+                    division_course = db.session.query(CourseDivisions).filter(
+                        CourseDivisions.DivisionId == division_id,
+                        CourseDivisions.CourseId == course.Id
+                    ).first()
+                    
+                    course_type = "إجبارية" if division_course and division_course.IsMandatory else "اختيارية"
+                    is_available = course.Status == "متاح"
+                    availability_status = "متاحة للتسجيل" if is_available else "غير متاحة حالياً"
+                    prerequisites = GraduationEligibilityService._get_course_prerequisites(course.Id, student_id)
+                    
+                    remaining_courses.append({
+                        "id": course.Id,
+                        "name": course.Name,
+                        "code": course.Code,
+                        "credits": course.Credits,
+                        "type": course_type,
+                        "availability_status": availability_status,
+                        "prerequisites": prerequisites,
+                        "semester": course.Semester,
+                        "category": "مواد التخصص"
+                    })
             
             return remaining_courses
             
@@ -348,9 +523,7 @@ class GraduationEligibilityService:
 
     @staticmethod
     def _get_course_prerequisites(course_id, student_id):
-        """الحصول على متطلبات المادة والتحقق من إكمالها"""
         try:
-            # الحصول على المتطلبات السابقة للمادة
             prerequisites = db.session.query(CoursePrerequisites, Courses).join(
                 Courses, CoursePrerequisites.PrerequisiteCourseId == Courses.Id
             ).filter(
@@ -360,7 +533,6 @@ class GraduationEligibilityService:
             if not prerequisites:
                 return "لا توجد متطلبات سابقة"
             
-            # التحقق من إكمال المتطلبات
             completed_course_ids = db.session.query(Enrollments.CourseId).filter(
                 Enrollments.StudentId == student_id,
                 Enrollments.IsCompleted == "مكتملة"
@@ -406,7 +578,7 @@ class GraduationEligibilityService:
                         (float(enrollment.Grade) if enrollment.Grade else 0)
                     ),
                     "semester": enrollment.Semester,
-                    "can_retake": True  # يمكن إعادة المادة الراسبة
+                    "can_retake": True  
                 }
                 for enrollment, course in failed
             ]
@@ -416,8 +588,6 @@ class GraduationEligibilityService:
 
     @staticmethod
     def _analyze_gpa(cumulative_gpa):
-        """تحليل المعدل التراكمي"""
-        # تحديد حالة المعدل
         if cumulative_gpa >= 3.5:
             status = "ممتاز"
             message = "المعدل التراكمي ممتاز. استمر في العمل الجيد!"
@@ -444,43 +614,43 @@ class GraduationEligibilityService:
 
     @staticmethod
     def _get_academic_warnings(student_id):
-        """الحصول على الإنذارات الأكاديمية"""
+        """الحصول على الإنذارات الأكاديمية - مبسط"""
         try:
             active_warnings = AcademicWarnings.query.filter(
                 AcademicWarnings.StudentId == student_id,
                 AcademicWarnings.Status == "نشط"
             ).all()
             
-            return [
-                {
-                    "id": warning.Id,
-                    "type": warning.WarningType,
-                    "level": warning.WarningLevel,
-                    "description": warning.Description,
-                    "issue_date": warning.IssueDate.isoformat() if warning.IssueDate else None,
-                    "action_required": warning.ActionRequired,
-                    "is_active": warning.Status == "نشط",
-                    "semester": warning.Semester
+            if not active_warnings:
+                return {
+                    "has_warnings": False,
+                    "count": 0,
+                    "types": []
                 }
-                for warning in active_warnings
-            ]
+            
+            warning_types = list(set([warning.WarningType for warning in active_warnings]))
+            
+            return {
+                "has_warnings": True,
+                "count": len(active_warnings),
+                "types": warning_types
+            }
         except Exception as e:
             logger.error(f"Error getting academic warnings: {str(e)}")
-            return []
+            return {
+                "has_warnings": False,
+                "count": 0,
+                "types": []
+            }
 
     @staticmethod
     def _determine_graduation_status(credits_analysis, cumulative_gpa, warnings):
-        """تحديد حالة أهلية التخرج"""
-        # التحقق من الساعات
         credits_complete = credits_analysis["remaining_total"] == 0
         
-        # التحقق من المعدل
         gpa_meets_requirement = cumulative_gpa >= GraduationEligibilityService.MINIMUM_GPA
         
-        # التحقق من الإنذارات
-        has_active_warnings = len([w for w in warnings if w.get("is_active", False)]) > 0
+        has_active_warnings = warnings.get("has_warnings", False)
         
-        # تحديد الحالة
         if credits_complete and gpa_meets_requirement and not has_active_warnings:
             status = "مؤهل للتخرج"
             message = "تهانينا! أنت مؤهل للتخرج."
@@ -495,8 +665,9 @@ class GraduationEligibilityService:
             message = f"يجب رفع المعدل التراكمي إلى {GraduationEligibilityService.MINIMUM_GPA} على الأقل"
             eligible = False
         elif has_active_warnings:
+            warning_types_text = " و ".join(warnings.get("types", []))
             status = "مشروط - إنذارات أكاديمية"
-            message = "يجب حل الإنذارات الأكاديمية أولاً"
+            message = f"يجب حل الإنذارات الأكاديمية أولاً ({warning_types_text})"
             eligible = False
         else:
             status = "غير مؤهل - متطلبات متعددة"
@@ -517,7 +688,6 @@ class GraduationEligibilityService:
 
     @staticmethod
     def _calculate_graduation_planning(credits_analysis, current_semester):
-        """حساب التخطيط للتخرج"""
         remaining_credits = credits_analysis["remaining_total"]
         
         if remaining_credits == 0:
@@ -528,11 +698,9 @@ class GraduationEligibilityService:
                 "recommended_load": "لا توجد مواد متبقية"
             }
         
-        # افتراض أن الطالب يأخذ 15-18 ساعة في الفصل
         average_credits_per_semester = 16
         semesters_remaining = max(1, (remaining_credits + average_credits_per_semester - 1) // average_credits_per_semester)
         
-        # حساب التاريخ المتوقع للتخرج (تقريبي)
         current_year = datetime.now().year
         expected_year = current_year + (semesters_remaining // 2)
         expected_semester = "الفصل الأول" if semesters_remaining % 2 == 1 else "الفصل الثاني"
@@ -545,11 +713,33 @@ class GraduationEligibilityService:
         }
 
     @staticmethod
-    def _generate_recommendations(graduation_status, credits_analysis, gpa_analysis, remaining_courses):
-        """إنشاء التوصيات الأكاديمية"""
+    def _generate_recommendations(graduation_status, credits_analysis, gpa_analysis, remaining_courses, student_info=None):
         recommendations = []
         
-        # توصيات بناءً على حالة التخرج
+        # التحقق من وجود معلومات الطالب
+        if student_info and "academic_stage" in student_info:
+            academic_stage = student_info["academic_stage"]
+            
+            # توصيات خاصة بالطلاب اللي لسه مختاروش تخصص
+            if academic_stage["specialization_status"] == "لم يتم اختيار التخصص النهائي بعد":
+                if academic_stage["can_choose_specialization"]:
+                    available_specs = [
+                        GraduationEligibilityService.DIVISION_SYSTEM.get(opt, {}).get('description', opt) 
+                        for opt in academic_stage.get('available_options', [])
+                    ]
+                    recommendations.append({
+                        "type": "تخصص",
+                        "priority": "عالية",
+                        "message": f"يمكنك اختيار التخصص النهائي. التخصصات المتاحة: {', '.join(available_specs)}"
+                    })
+                else:
+                    recommendations.append({
+                        "type": "أكاديمي",
+                        "priority": "متوسطة",
+                        "message": f"أكمل مواد {academic_stage['stage']} أولاً قبل اختيار التخصص النهائي"
+                    })
+        
+        # التوصيات العادية للتخرج
         if not graduation_status["eligible"]:
             if not graduation_status["requirements_met"]["credits"]:
                 remaining_credits = credits_analysis["remaining_total"]
@@ -577,10 +767,10 @@ class GraduationEligibilityService:
                     "message": f"يجب رفع المعدل التراكمي من {gpa_analysis['current_gpa']} إلى {GraduationEligibilityService.MINIMUM_GPA} على الأقل"
                 })
         
-        # توصيات للمواد المتاحة
-        available_courses = [course for course in remaining_courses if course["availability_status"] == "متاحة للتسجيل"]
+        # توصيات المواد المتاحة
+        available_courses = [course for course in remaining_courses if course.get("availability_status") == "متاحة للتسجيل" and course.get("id") != "SPECIALIZATION_INFO"]
         if available_courses:
-            mandatory_available = [c for c in available_courses if c["type"] == "إجبارية"]
+            mandatory_available = [c for c in available_courses if c.get("type") == "إجبارية"]
             if mandatory_available:
                 recommendations.append({
                     "type": "تسجيل",
@@ -588,8 +778,7 @@ class GraduationEligibilityService:
                     "message": f"يوجد {len(mandatory_available)} مادة إجبارية متاحة للتسجيل حالياً"
                 })
         
-        # توصيات للمواد غير المتاحة
-        unavailable_courses = [course for course in remaining_courses if course["availability_status"] != "متاحة للتسجيل"]
+        unavailable_courses = [course for course in remaining_courses if course.get("availability_status") != "متاحة للتسجيل" and course.get("id") != "SPECIALIZATION_INFO"]
         if unavailable_courses:
             recommendations.append({
                 "type": "تخطيط",
@@ -597,7 +786,6 @@ class GraduationEligibilityService:
                 "message": f"يوجد {len(unavailable_courses)} مادة غير متاحة حالياً - خطط للفصول القادمة"
             })
         
-        # توصيات عامة
         if graduation_status["completion_percentage"] > 80:
             recommendations.append({
                 "type": "تحفيزي",
@@ -611,19 +799,16 @@ class GraduationEligibilityService:
     def _calculate_gpa(student_id):
         """حساب المعدل التراكمي الصحيح بناءً على الساعات المعتمدة والدرجات"""
         try:
-            # الحصول على بيانات الطالب
             student = Students.query.get(student_id)
             if not student:
                 return 0.0
             
-            # الحصول على تاريخ المعدل التراكمي
             gpa_history = []
             for i in range(1, student.Semester + 1):
                 gpa_field = f'GPA{i}'
                 if hasattr(student, gpa_field) and getattr(student, gpa_field) is not None:
                     gpa_history.append(float(getattr(student, gpa_field)))
             
-            # حساب المتوسط
             if gpa_history:
                 cumulative_gpa = sum(gpa_history) / len(gpa_history)
                 return round(cumulative_gpa, 2)
@@ -839,8 +1024,7 @@ class EnrollmentPeriodService:
             return "نشطة" 
 
 class SmartCourseRecommendationService:
-    """خدمة التوصية الذكية للمواد الدراسية"""
-    
+
     def __init__(self):
         self.weights = {
             'content_based': 0.3,
@@ -850,24 +1034,84 @@ class SmartCourseRecommendationService:
             'gpa_improvement': 0.1
         }
     
-    def get_smart_recommendations(self, student_id):
-        """الحصول على التوصيات الذكية للطالب"""
+    def _check_enrollment_period(self):
+        """فحص ما إذا كانت فترة التسجيل مفتوحة أم لا"""
         try:
-            # جمع بيانات الطالب
+            current_date = datetime.now()
+            
+            # البحث عن فترة التسجيل الحالية
+            active_period = EnrollmentPeriods.query.filter(
+                EnrollmentPeriods.StartDate <= current_date,
+                EnrollmentPeriods.EndDate >= current_date
+            ).first()
+            
+            if active_period:
+                return {
+                    'is_open': True,
+                    'message': f'فترة التسجيل مفتوحة حتى {active_period.EndDate.strftime("%Y-%m-%d")}',
+                    'period_info': {
+                        'semester': active_period.Semester,
+                        'start_date': active_period.StartDate.strftime("%Y-%m-%d"),
+                        'end_date': active_period.EndDate.strftime("%Y-%m-%d")
+                    }
+                }
+            else:
+                # البحث عن آخر فترة تسجيل انتهت
+                last_period = EnrollmentPeriods.query.filter(
+                    EnrollmentPeriods.EndDate < current_date
+                ).order_by(EnrollmentPeriods.EndDate.desc()).first()
+                
+                if last_period:
+                    return {
+                        'is_open': False,
+                        'message': f'فترة التسجيل انتهت في {last_period.EndDate.strftime("%Y-%m-%d")}',
+                        'period_info': {
+                            'semester': last_period.Semester,
+                            'end_date': last_period.EndDate.strftime("%Y-%m-%d")
+                        }
+                    }
+                else:
+                    return {
+                        'is_open': False,
+                        'message': 'لا توجد فترة تسجيل محددة حالياً',
+                        'period_info': None
+                    }
+                    
+        except Exception as e:
+            logger.error(f"Error checking enrollment period: {str(e)}")
+            return {
+                'is_open': False,
+                'message': 'حدث خطأ أثناء فحص فترة التسجيل',
+                'period_info': None
+            }
+    
+    def get_smart_recommendations(self, student_id):
+        try:
+            # فحص فترة التسجيل أولاً
+            enrollment_status = self._check_enrollment_period()
+            
+            if not enrollment_status['is_open']:
+                return {
+                    'enrollment_closed': True,
+                    'message': enrollment_status['message'],
+                    'period_info': enrollment_status['period_info'],
+                    'recommendations_available': False
+                }
+            
             student_data = self._get_enhanced_student_data(student_id)
             if not student_data:
                 return {"error": "الطالب غير موجود"}, 404
             
-            # تصنيف الطالب أكاديمياً
             academic_status = self._classify_student_academic_status(student_data)
             
-            # الحصول على المواد المتاحة
             available_courses = self._get_available_courses(student_data)
             
-            # تطبيق خوارزميات التوصية المختلفة
             recommendations = self._generate_categorized_recommendations(
                 student_data, available_courses, academic_status
             )
+            
+            # إضافة معلومات فترة التسجيل للتوصيات
+            recommendations['enrollment_period'] = enrollment_status
             
             return recommendations
             
@@ -876,31 +1120,25 @@ class SmartCourseRecommendationService:
             return {"error": str(e)}, 500
     
     def _get_enhanced_student_data(self, student_id):
-        """جمع بيانات شاملة عن الطالب"""
         try:
             student = Students.query.get(student_id)
             if not student:
                 return None
             
-            # الحصول على معلومات القسم من خلال الشعبة
             department_id = None
             if student.DivisionId:
                 division = Divisions.query.get(student.DivisionId)
                 if division:
                     department_id = division.DepartmentId
             
-            # الحصول على المعدل التراكمي الحالي
             current_gpa = self._get_current_gpa(student)
             
-            # الحصول على المواد المكتملة والراسب فيها والمسجل فيها حالياً
             completed_courses = self._get_completed_courses(student_id)
             failed_courses = self._get_failed_courses(student_id)
             currently_enrolled_course_ids = self._get_currently_enrolled_courses(student_id)
             
-            # تحليل الأداء الأكاديمي
             performance_analysis = self._analyze_academic_performance(student)
             
-            # تحليل أنماط الحضور
             attendance_analysis = self._analyze_attendance_patterns(student_id)
             
             return {
@@ -924,7 +1162,6 @@ class SmartCourseRecommendationService:
             return None
     
     def _get_current_gpa(self, student):
-        """الحصول على المعدل التراكمي الحالي - متوسط جميع الفصول"""
         try:
             gpa_history = self._get_gpa_history(student)
             if gpa_history:
@@ -935,7 +1172,6 @@ class SmartCourseRecommendationService:
             return 0.0
     
     def _get_gpa_history(self, student):
-        """الحصول على تاريخ المعدل التراكمي"""
         try:
             gpa_history = []
             for i in range(1, student.Semester + 1):
@@ -948,7 +1184,6 @@ class SmartCourseRecommendationService:
             return []
     
     def _get_completed_courses(self, student_id):
-        """الحصول على المواد المكتملة بنجاح"""
         try:
             enrollments = Enrollments.query.filter_by(
                 StudentId=student_id,
@@ -959,7 +1194,6 @@ class SmartCourseRecommendationService:
             for enrollment in enrollments:
                 course = Courses.query.get(enrollment.CourseId)
                 if course:
-                    # حساب الدرجة الكلية من 150 (30 + 30 + 90)
                     exam1_grade = float(enrollment.Exam1Grade) if enrollment.Exam1Grade else 0
                     exam2_grade = float(enrollment.Exam2Grade) if enrollment.Exam2Grade else 0
                     final_grade = float(enrollment.Grade) if enrollment.Grade else 0
@@ -970,7 +1204,7 @@ class SmartCourseRecommendationService:
                         'name': course.Name,
                         'code': course.Code,
                         'credits': course.Credits,
-                        'grade': total_grade,  # الدرجة الكلية من 150
+                        'grade': total_grade,  
                         'exam1_grade': exam1_grade,
                         'exam2_grade': exam2_grade,
                         'final_grade': final_grade,
@@ -983,7 +1217,6 @@ class SmartCourseRecommendationService:
             return []
     
     def _get_currently_enrolled_courses(self, student_id):
-        """الحصول على المواد المسجل فيها حالياً (قيد الدراسة)"""
         try:
             enrollments = Enrollments.query.filter_by(
                 StudentId=student_id,
@@ -998,39 +1231,59 @@ class SmartCourseRecommendationService:
             return []
     
     def _get_failed_courses(self, student_id):
-        """الحصول على المواد الراسب فيها"""
         try:
-            enrollments = Enrollments.query.filter_by(
+            # جلب المواد الراسب فيها
+            failed_enrollments = Enrollments.query.filter_by(
                 StudentId=student_id,
                 IsCompleted='راسب'
             ).all()
             
+            # جلب المواد المسجل فيها حالياً
+            current_enrollments = Enrollments.query.filter_by(
+                StudentId=student_id,
+                IsCompleted='قيد الدراسة'
+            ).all()
+            
+            currently_enrolled_course_ids = [enrollment.CourseId for enrollment in current_enrollments]
+            
+            # الحصول على بيانات الطالب للترم الحالي
+            student = Students.query.get(student_id)
+            current_semester_name = f"الترم {student.Semester}" if student else "الترم 1"
+            
             failed_courses = []
-            for enrollment in enrollments:
-                course = Courses.query.get(enrollment.CourseId)
-                if course:
-                    # التحقق من كون المادة إجبارية
-                    is_mandatory = self._is_course_mandatory(course.Id, student_id)
-                    
-                    # الحصول على معلومات الحصة
-                    class_info = self._get_course_class_info(course.Id)
-                    
-                    failed_courses.append({
-                        'id': course.Id,
-                        'name': course.Name,
-                        'code': course.Code,
-                        'description': course.Description,
-                        'credits': course.Credits,
-                        'semester': course.Semester,
-                        'is_mandatory': is_mandatory,
-                        'max_seats': course.MaxSeats,
-                        'current_enrolled': course.CurrentEnrolledStudents,
-                        'professor_name': class_info.get('professor_name'),
-                        'day_name': class_info.get('day_name'),
-                        'start_time': class_info.get('start_time'),
-                        'end_time': class_info.get('end_time'),
-                        'location': class_info.get('location')
-                    })
+            for enrollment in failed_enrollments:
+                # تجاهل المواد الراسب فيها إذا كان مسجل فيها حالياً
+                if enrollment.CourseId not in currently_enrolled_course_ids:
+                    course = Courses.query.get(enrollment.CourseId)
+                    if course:
+                        is_mandatory = self._is_course_mandatory(course.Id, student_id)
+                        
+                        class_info = self._get_course_class_info(course.Id)
+                        
+                        # حساب عدد الطلاب المسجلين حالياً في نفس الترم
+                        current_enrolled_count = db.session.query(Enrollments).filter(
+                            Enrollments.CourseId == course.Id,
+                            Enrollments.Semester == current_semester_name,
+                            Enrollments.IsCompleted == 'قيد الدراسة'
+                        ).count()
+                        
+                        failed_courses.append({
+                            'id': course.Id,
+                            'name': course.Name,
+                            'code': course.Code,
+                            'description': course.Description,
+                            'credits': course.Credits,
+                            'semester': course.Semester,
+                            'is_mandatory': is_mandatory,
+                            'max_seats': course.MaxSeats,
+                            'current_enrolled': current_enrolled_count,  # العدد المحسوب من جدول Enrollments
+                            'available_seats': course.MaxSeats - current_enrolled_count,
+                            'professor_name': class_info.get('professor_name'),
+                            'day_name': class_info.get('day'),
+                            'start_time': class_info.get('start_time'),
+                            'end_time': class_info.get('end_time'),
+                            'location': class_info.get('location')
+                        })
             
             return failed_courses
         except Exception as e:
@@ -1038,7 +1291,6 @@ class SmartCourseRecommendationService:
             return []
     
     def _is_course_mandatory(self, course_id, student_id):
-        """التحقق من كون المادة إجبارية للطالب"""
         try:
             student = Students.query.get(student_id)
             if not student:
@@ -1056,13 +1308,11 @@ class SmartCourseRecommendationService:
             return False
     
     def _classify_student_academic_status(self, student_data):
-        """تصنيف الطالب أكاديمياً"""
         try:
             current_gpa = student_data['current_gpa']
             failed_courses_count = len(student_data['failed_courses'])
             gpa_history = student_data['gpa_history']
             
-            # تحليل اتجاه المعدل
             gpa_trend = 'stable'
             if len(gpa_history) >= 2:
                 if gpa_history[-1] > gpa_history[-2]:
@@ -1070,7 +1320,6 @@ class SmartCourseRecommendationService:
                 elif gpa_history[-1] < gpa_history[-2]:
                     gpa_trend = 'declining'
             
-            # تصنيف الطالب
             if current_gpa >= 3.5:
                 status = 'excellent'
             elif current_gpa >= 3.0:
@@ -1082,7 +1331,6 @@ class SmartCourseRecommendationService:
             else:
                 status = 'at_risk'
             
-            # تعديل التصنيف بناءً على عوامل إضافية
             if failed_courses_count > 3:
                 status = 'at_risk'
             elif failed_courses_count > 1 and current_gpa < 2.5:
@@ -1103,9 +1351,7 @@ class SmartCourseRecommendationService:
             return {'status': 'unknown', 'gpa_trend': 'stable', 'risk_factors': {}}
     
     def _analyze_academic_performance(self, student):
-        """تحليل الأداء الأكاديمي للطالب"""
         try:
-            # تحليل الأداء في المواد المختلفة
             enrollments = Enrollments.query.filter_by(
                 StudentId=student.Id,
                 IsCompleted='ناجح'
@@ -1118,7 +1364,6 @@ class SmartCourseRecommendationService:
             for enrollment in enrollments:
                 course = Courses.query.get(enrollment.CourseId)
                 if course:
-                    # حساب الدرجة الكلية من 150 (30 + 30 + 90)
                     exam1_grade = float(enrollment.Exam1Grade) if enrollment.Exam1Grade else 0
                     exam2_grade = float(enrollment.Exam2Grade) if enrollment.Exam2Grade else 0
                     final_grade = float(enrollment.Grade) if enrollment.Grade else 0
@@ -1126,8 +1371,7 @@ class SmartCourseRecommendationService:
                     
                     credits = course.Credits
                     
-                    # تصنيف المادة حسب النوع - سيتم إزالة هذا لاحقاً
-                    subject_type = 'general'  # تبسيط التصنيف
+                    subject_type = 'general'  
                     
                     if subject_type not in subject_performance:
                         subject_performance[subject_type] = {
@@ -1143,7 +1387,6 @@ class SmartCourseRecommendationService:
                     total_credits += credits
                     weighted_grade_sum += total_grade * credits
             
-            # حساب المتوسط لكل نوع مادة
             for subject_type in subject_performance:
                 perf = subject_performance[subject_type]
                 if perf['total_credits'] > 0:
@@ -1156,8 +1399,8 @@ class SmartCourseRecommendationService:
             return {
                 'subject_performance': subject_performance,
                 'overall_average': overall_average,
-                'strengths': [],  # سيتم تبسيط هذا
-                'weaknesses': []  # سيتم تبسيط هذا
+                'strengths': [],  
+                'weaknesses': []  
             }
             
         except Exception as e:
@@ -1165,9 +1408,7 @@ class SmartCourseRecommendationService:
             return {}
     
     def _analyze_attendance_patterns(self, student_id):
-        """تحليل أنماط الحضور"""
         try:
-            # الحصول على بيانات الحضور
             attendance_records = Attendances.query.filter_by(StudentId=student_id).all()
             
             if not attendance_records:
@@ -1177,7 +1418,6 @@ class SmartCourseRecommendationService:
             attended_sessions = sum(1 for record in attendance_records if record.Status)
             attendance_rate = (attended_sessions / total_sessions) * 100
             
-            # تحديد نمط الحضور
             if attendance_rate >= 90:
                 pattern = 'excellent'
             elif attendance_rate >= 80:
@@ -1199,9 +1439,7 @@ class SmartCourseRecommendationService:
             return {'attendance_rate': 100, 'pattern': 'no_data'}
     
     def _get_available_courses(self, student_data):
-        """الحصول على المواد المتاحة للطالب مع معلومات الأستاذ والجدول"""
         try:
-            # الحصول على المواد المتاحة للقسم والشعبة
             available_courses = db.session.query(Courses).join(
                 CourseDivisions, Courses.Id == CourseDivisions.CourseId
             ).filter(
@@ -1209,15 +1447,25 @@ class SmartCourseRecommendationService:
                 Courses.Status == 'متاح'
             ).all()
             
-            # فلترة المواد المكتملة بالفعل والمسجل فيها حالياً
             completed_course_ids = [course['id'] for course in student_data['completed_courses']]
-            currently_enrolled_course_ids = student_data.get('currently_enrolled_course_ids', [])
+            
+            # الحصول على المواد المسجل فيها حالياً بتفاصيل أكثر
+            current_enrollments = Enrollments.query.filter_by(
+                StudentId=student_data['id'],
+                IsCompleted='قيد الدراسة'
+            ).all()
+            
+            currently_enrolled_course_ids = [enrollment.CourseId for enrollment in current_enrollments]
+            
+            # دمج المواد المكتملة والمسجل فيها حالياً
             excluded_course_ids = completed_course_ids + currently_enrolled_course_ids
+            
+            # الحصول على الترم الحالي للطالب
+            current_semester_name = f"الترم {student_data['current_semester']}"
             
             filtered_courses = []
             for course in available_courses:
                 if course.Id not in excluded_course_ids:
-                    # التحقق من المتطلبات السابقة
                     prerequisites_met = self._check_prerequisites(course.Id, completed_course_ids)
                     
                     if prerequisites_met:
@@ -1226,8 +1474,14 @@ class SmartCourseRecommendationService:
                             DivisionId=student_data['division_id']
                         ).first()
                         
-                        # الحصول على معلومات الفصل والأستاذ
                         class_info = self._get_course_class_info(course.Id)
+                        
+                        # حساب عدد الطلاب المسجلين حالياً في نفس الترم
+                        current_enrolled_count = db.session.query(Enrollments).filter(
+                            Enrollments.CourseId == course.Id,
+                            Enrollments.Semester == current_semester_name,
+                            Enrollments.IsCompleted == 'قيد الدراسة'
+                        ).count()
                         
                         filtered_courses.append({
                             'id': course.Id,
@@ -1238,10 +1492,11 @@ class SmartCourseRecommendationService:
                             'semester': course.Semester,
                             'is_mandatory': course_division.IsMandatory if course_division else False,
                             'max_seats': course.MaxSeats,
-                            'current_enrolled': course.CurrentEnrolledStudents,
+                            'current_enrolled': current_enrolled_count,  # العدد المحسوب من جدول Enrollments
+                            'available_seats': course.MaxSeats - current_enrolled_count,
                             'professor_name': class_info.get('professor_name', 'غير محدد'),
                             'day': class_info.get('day', 'غير محدد'),
-                            'day_name': class_info.get('day_name', 'غير محدد'),
+                            'day_name': class_info.get('day', 'غير محدد'),
                             'start_time': class_info.get('start_time', 'غير محدد'),
                             'end_time': class_info.get('end_time', 'غير محدد'),
                             'location': class_info.get('location', 'غير محدد')
@@ -1254,7 +1509,6 @@ class SmartCourseRecommendationService:
             return []
     
     def _get_course_class_info(self, course_id):
-        """الحصول على معلومات الفصل والأستاذ للمادة"""
         try:
             class_session = Classes.query.filter_by(CourseId=course_id).first()
             
@@ -1263,21 +1517,9 @@ class SmartCourseRecommendationService:
             
             professor = Professors.query.get(class_session.ProfessorId)
             
-            # تحويل رقم اليوم إلى اسم اليوم
-            day_names = {
-                '1': 'السبت',
-                '2': 'الأحد', 
-                '3': 'الاثنين',
-                '4': 'الثلاثاء',
-                '5': 'الأربعاء',
-                '6': 'الخميس',
-                '7': 'الجمعة'
-            }
-            
             return {
                 'professor_name': professor.FullName if professor else 'غير محدد',
                 'day': class_session.Day,
-                'day_name': day_names.get(str(class_session.Day), f'يوم {class_session.Day}'),
                 'start_time': str(class_session.StartTime) if class_session.StartTime else 'غير محدد',
                 'end_time': str(class_session.EndTime) if class_session.EndTime else 'غير محدد',
                 'location': class_session.Location or 'غير محدد'
@@ -1288,7 +1530,6 @@ class SmartCourseRecommendationService:
             return {}
     
     def _check_prerequisites(self, course_id, completed_course_ids):
-        """التحقق من المتطلبات السابقة للمادة"""
         try:
             prerequisites = CoursePrerequisites.query.filter_by(CourseId=course_id).all()
             
@@ -1303,27 +1544,21 @@ class SmartCourseRecommendationService:
             return True
     
     def _generate_categorized_recommendations(self, student_data, available_courses, academic_status):
-        """توليد التوصيات المصنفة"""
         try:
             current_semester = student_data['current_semester']
             
-            # تصنيف المواد حسب النوع والترم
             current_semester_mandatory = []
-            elective_courses = []  # المواد الاختيارية الأصلية فقط
+            elective_courses = []  
             
             for course in available_courses:
                 if course['is_mandatory']:
                     if course['semester'] == current_semester:
-                        # مواد إجبارية للترم الحالي
                         current_semester_mandatory.append(course)
-                    # المواد الإجبارية من الترمات السابقة والقادمة ستكون لها APIs منفصلة
                 else:
-                    # المواد الاختيارية الأصلية فقط
                     elective_courses.append(course)
             
             failed_mandatory_courses = [course for course in student_data['failed_courses'] if course['is_mandatory']]
             
-            # توليد التوصيات لكل فئة
             recommendations = {
                 'mandatory_courses': self._recommend_mandatory_courses(
                     current_semester_mandatory, student_data, academic_status
@@ -1348,19 +1583,15 @@ class SmartCourseRecommendationService:
             return {}
     
     def _recommend_mandatory_courses(self, mandatory_courses, student_data, academic_status):
-        """توصية المواد الإجبارية للترم الحالي"""
         try:
             recommendations = []
             current_semester = student_data['current_semester']
             
             for course in mandatory_courses:
-                # حساب درجة الأولوية
                 priority_score = self._calculate_mandatory_priority(course, student_data)
                 
-                # حساب درجة الصعوبة المتوقعة
                 difficulty_score = self._estimate_course_difficulty(course, student_data)
                 
-                # تحديد التوصية
                 recommendation_reason = self._get_mandatory_recommendation_reason(
                     course, student_data, priority_score, difficulty_score, current_semester
                 )
@@ -1373,19 +1604,16 @@ class SmartCourseRecommendationService:
                     'suggested_semester': current_semester  # الترم الحالي
                 })
             
-            # ترتيب حسب الأولوية
             recommendations.sort(key=lambda x: x['priority_score'], reverse=True)
             
-            return recommendations  # إرجاع جميع التوصيات للترم الحالي
+            return recommendations  
             
         except Exception as e:
             logger.error(f"Error recommending mandatory courses: {str(e)}")
             return []
     
     def _recommend_failed_courses_retry(self, failed_courses, student_data, academic_status):
-        """توصية إعادة المواد الراسب فيها"""
         try:
-            # إذا لم توجد مواد راسب فيها
             if not failed_courses:
                 return {
                     'message': 'لا توجد مواد راسب فيها تحتاج إلى إعادة',
@@ -1398,14 +1626,11 @@ class SmartCourseRecommendationService:
             recommendations = []
             
             for course in failed_courses:
-                # حساب الأولوية والصعوبة
                 priority_score = self._calculate_mandatory_priority(course, student_data)
                 difficulty_score = self._estimate_course_difficulty(course, student_data)
                 
-                # تحديد الترم المقترح
                 suggested_semester = self._suggest_optimal_semester(course, student_data, academic_status)
                 
-                # سبب التوصية
                 recommendation_reason = self._get_mandatory_recommendation_reason(
                     course, student_data, priority_score, difficulty_score, student_data['current_semester']
                 )
@@ -1418,7 +1643,6 @@ class SmartCourseRecommendationService:
                     'suggested_semester': suggested_semester
                 })
             
-            # ترتيب حسب الأولوية
             recommendations.sort(key=lambda x: x['priority_score'], reverse=True)
             
             return {
@@ -1454,22 +1678,16 @@ class SmartCourseRecommendationService:
             recommendations = []
             
             for course in elective_courses:
-                # حساب احتمالية الحصول على درجة عالية
                 high_grade_probability = self._calculate_high_grade_probability(course, student_data)
                 
-                # تقييم سهولة المادة
                 ease_score = self._calculate_course_ease_score(course, student_data)
                 
-                # حساب تأثير المادة على المعدل
                 gpa_impact = self._calculate_gpa_impact(course, student_data)
                 
-                # شروط مرنة حسب حالة الطالب
                 if academic_status['status'] == 'at_risk':
-                    # شروط أكثر مرونة للطلاب المتعثرين
                     min_ease_score = 0.4
                     min_probability = 0.5
                 else:
-                    # شروط عادية للطلاب الآخرين
                     min_ease_score = 0.6
                     min_probability = 0.7
                 
@@ -1482,10 +1700,8 @@ class SmartCourseRecommendationService:
                         'recommendation_reason': f"مادة مناسبة مع احتمالية {high_grade_probability*100:.0f}% للحصول على درجة جيدة (سهولة: {ease_score*100:.0f}%)"
                     })
             
-            # ترتيب حسب التأثير على المعدل
             recommendations.sort(key=lambda x: x['gpa_impact'], reverse=True)
             
-            # إذا لم توجد مواد مناسبة
             if not recommendations:
                 return {
                     'message': f'معدلك التراكمي ({current_gpa:.2f}) يحتاج تحسين لكن لا توجد مواد اختيارية سهلة متاحة حالياً',
@@ -1510,23 +1726,15 @@ class SmartCourseRecommendationService:
             }
     
     def _recommend_elective_courses(self, elective_courses, student_data, academic_status):
-        """توصية المواد الاختيارية الأصلية فقط"""
         try:
             recommendations = []
             
             for course in elective_courses:
-                # التأكد من أن المادة اختيارية أصلية فقط
                 if not course['is_mandatory']:
-                    # حساب التشابه مع المواد المكتملة
-                    content_similarity = self._calculate_content_similarity(course, student_data)
-                    
-                    # تقييم التوافق مع نقاط القوة
+                    content_similarity = self._calculate_content_similarity(course, student_data)                   
                     strength_alignment = self._calculate_strength_alignment(course, student_data)
                     
-                    # تقييم الفائدة المهنية
-                    career_relevance = self._calculate_career_relevance(course, student_data)
-                    
-                    # حساب النتيجة الإجمالية
+                    career_relevance = self._calculate_career_relevance(course, student_data)                   
                     overall_score = (
                         content_similarity * 0.3 +
                         strength_alignment * 0.4 +
@@ -1545,7 +1753,6 @@ class SmartCourseRecommendationService:
                         'course_type': 'elective'
                     })
             
-            # ترتيب حسب النتيجة الإجمالية
             recommendations.sort(key=lambda x: x['overall_score'], reverse=True)
             
             return recommendations 
@@ -1577,9 +1784,7 @@ class SmartCourseRecommendationService:
             return 0.5
     
     def _estimate_course_difficulty(self, course, student_data):
-        """تقدير صعوبة المادة"""
         try:
-            # حساب متوسط الدرجات الكلية للطلاب في هذه المادة (من 150)
             enrollments = Enrollments.query.filter(
                 Enrollments.CourseId == course['id'],
                 or_(
@@ -1599,24 +1804,21 @@ class SmartCourseRecommendationService:
                     total_grades.append(total_grade)
                 
                 avg_grade = sum(total_grades) / len(total_grades)
-                # كلما قل المتوسط، زادت الصعوبة (الدرجة الكلية من 150)
                 difficulty = 1.0 - (avg_grade / 150.0)
             else:
-                difficulty = 0.5  # متوسط افتراضي
+                difficulty = 0.5  
             
-            return max(0.0, min(1.0, difficulty))  # التأكد من أن القيمة بين 0 و 1
+            return max(0.0, min(1.0, difficulty)) 
             
         except Exception as e:
             logger.error(f"Error estimating course difficulty: {str(e)}")
             return 0.5
     
     def _calculate_content_similarity(self, course, student_data):
-        """حساب التشابه في المحتوى"""
         try:
             if not student_data['completed_courses']:
                 return 0.5
             
-            # استخدام TF-IDF لحساب التشابه
             course_desc = course.get('description', '')
             completed_descs = [c['name'] for c in student_data['completed_courses']]
             
@@ -1814,17 +2016,14 @@ class SmartCourseRecommendationService:
             return 0.5
     
     def _calculate_similar_courses_performance(self, course, student_data):
-        """حساب الأداء في المواد المشابهة"""
         try:
             completed_courses = student_data.get('completed_courses', [])
             if not completed_courses:
                 return 0.5
             
-            # حساب متوسط الدرجات في المواد المكتملة
             total_grades = sum(course['grade'] for course in completed_courses)
             avg_grade = total_grades / len(completed_courses)
             
-            # تحويل إلى نسبة من 1 (الدرجة الكلية من 150)
             performance_ratio = avg_grade / 150.0
             
             return min(performance_ratio, 1.0)
@@ -1832,18 +2031,11 @@ class SmartCourseRecommendationService:
         except Exception as e:
             logger.error(f"Error calculating similar courses performance: {str(e)}")
             return 0.5 
-
-
-
-
 class CourseEnrollmentService:
-    """خدمة تسجيل المواد مع جميع القواعد والتحققات المطلوبة"""
     
     @staticmethod
     def enroll_student_in_course(student_id, course_id):
-        """تسجيل طالب في مادة واحدة مع جميع التحققات المطلوبة"""
         try:
-            # 1. التحقق من فترة التسجيل
             enrollment_check = CourseEnrollmentService._check_enrollment_period()
             if not enrollment_check["is_active"]:
                 return {
@@ -1851,7 +2043,6 @@ class CourseEnrollmentService:
                     "message": enrollment_check["message"]
                 }
             
-            # 2. التحقق من وجود الطالب
             student = Students.query.get(student_id)
             if not student:
                 return {
@@ -1859,7 +2050,6 @@ class CourseEnrollmentService:
                     "message": "الطالب غير موجود"
                 }
             
-            # 3. التحقق من وجود المادة
             course = Courses.query.get(course_id)
             if not course:
                 return {
@@ -1867,10 +2057,8 @@ class CourseEnrollmentService:
                     "message": "المادة غير موجودة"
                 }
             
-            # 4. الحصول على الفصل الدراسي الحالي
             current_semester = CourseEnrollmentService._get_current_semester()
             
-            # 5. التحقق من عدم وجود تسجيل سابق للمادة
             existing_enrollment = Enrollments.query.filter_by(
                 StudentId=student_id,
                 CourseId=course_id
@@ -1890,7 +2078,6 @@ class CourseEnrollmentService:
                         "message": f"الطالب أكمل هذه المادة ({course.Name}) مسبقاً ولا يمكن إعادة تسجيلها"
                     }
             
-            # 6. التحقق من الساعات المسموحة للطالب
             credit_check = CourseEnrollmentService._check_credit_limit(student, course, current_semester)
             if not credit_check["allowed"]:
                 return {
@@ -1898,7 +2085,6 @@ class CourseEnrollmentService:
                     "message": credit_check["message"]
                 }
             
-            # 7. التحقق من أن المادة متاحة للطالب (من التوصيات)
             availability_check = CourseEnrollmentService._check_course_availability(student_id, course_id)
             if not availability_check["available"]:
                 return {
@@ -1906,8 +2092,7 @@ class CourseEnrollmentService:
                     "message": availability_check["message"]
                 }
             
-            # 8. إنشاء التسجيل الجديد
-            # تحقق إضافي للأمان قبل إنشاء التسجيل
+           
             final_check = Enrollments.query.filter_by(
                 StudentId=student_id,
                 CourseId=course_id,
@@ -1924,7 +2109,7 @@ class CourseEnrollmentService:
                 StudentId=student_id,
                 CourseId=course_id,
                 Semester=current_semester,
-                NumberOFSemster=student.Semester,  # رقم الترم الحالي للطالب
+                NumberOFSemster=student.Semester,  
                 AddedEnrollmentDate=datetime.now().date(),
                 IsCompleted="قيد الدراسة",
                 Exam1Grade=None,
@@ -1933,11 +2118,6 @@ class CourseEnrollmentService:
             )
             
             db.session.add(new_enrollment)
-            
-            # 9. تحديث عدد الطلاب المسجلين في المادة
-            if hasattr(course, 'CurrentEnrolledStudents'):
-                course.CurrentEnrolledStudents = (course.CurrentEnrolledStudents or 0) + 1
-            
             db.session.commit()
             
             return {
@@ -1963,9 +2143,8 @@ class CourseEnrollmentService:
     
     @staticmethod
     def cancel_enrollment(enrollment_id):
-        """إلغاء تسجيل مادة (حذف مؤقت)"""
+       
         try:
-            # 1. البحث عن التسجيل
             enrollment = Enrollments.query.get(enrollment_id)
             if not enrollment:
                 return {
@@ -1973,23 +2152,16 @@ class CourseEnrollmentService:
                     "message": "التسجيل غير موجود"
                 }
             
-            # 2. التحقق من أن التسجيل قيد الدراسة
             if enrollment.IsCompleted != "قيد الدراسة":
                 return {
                     "success": False,
                     "message": f"لا يمكن إلغاء هذا التسجيل. الحالة الحالية: {enrollment.IsCompleted}"
                 }
             
-            # 3. الحصول على بيانات المادة
             course = Courses.query.get(enrollment.CourseId)
             
-            # 4. تحديث بيانات التسجيل
             enrollment.DeletedEnrollmentDate = datetime.now().date()
             enrollment.IsCompleted = "ملغاة"
-            
-            # 5. تحديث عدد الطلاب المسجلين في المادة
-            if course and hasattr(course, 'CurrentEnrolledStudents') and course.CurrentEnrolledStudents > 0:
-                course.CurrentEnrolledStudents -= 1
             
             db.session.commit()
             
@@ -2014,9 +2186,7 @@ class CourseEnrollmentService:
     
     @staticmethod
     def hard_delete_enrollment(enrollment_id):
-        """حذف نهائي للتسجيل (للإدارة فقط)"""
         try:
-            # 1. البحث عن التسجيل
             enrollment = Enrollments.query.get(enrollment_id)
             if not enrollment:
                 return {
@@ -2024,18 +2194,10 @@ class CourseEnrollmentService:
                     "message": "التسجيل غير موجود"
                 }
             
-            # 2. الحصول على بيانات المادة قبل الحذف
             course = Courses.query.get(enrollment.CourseId)
             course_name = course.Name if course else "غير محدد"
             course_code = course.Code if course else "غير محدد"
             
-            # 3. تحديث عدد الطلاب المسجلين إذا كان التسجيل نشطاً
-            if (enrollment.IsCompleted == "قيد الدراسة" and 
-                course and hasattr(course, 'CurrentEnrolledStudents') and 
-                course.CurrentEnrolledStudents > 0):
-                course.CurrentEnrolledStudents -= 1
-            
-            # 4. حذف التسجيل نهائياً
             db.session.delete(enrollment)
             db.session.commit()
             
@@ -2060,9 +2222,7 @@ class CourseEnrollmentService:
     
     @staticmethod
     def get_student_enrollments(student_id):
-        """الحصول على جميع تسجيلات الطالب في الفصل الحالي"""
         try:
-            # 1. التحقق من وجود الطالب
             student = Students.query.get(student_id)
             if not student:
                 return {
@@ -2070,16 +2230,13 @@ class CourseEnrollmentService:
                     "message": "الطالب غير موجود"
                 }
             
-            # 2. الحصول على الفصل الدراسي الحالي
             current_semester = CourseEnrollmentService._get_current_semester()
             
-            # 3. الحصول على جميع التسجيلات للطالب في الفصل الحالي
             enrollments = Enrollments.query.filter_by(
                 StudentId=student_id,
                 Semester=current_semester
             ).all()
             
-            # 4. تصنيف التسجيلات
             active_enrollments = []
             cancelled_enrollments = []
             total_credits = 0
@@ -2104,7 +2261,6 @@ class CourseEnrollmentService:
                     enrollment_data["cancellation_date"] = enrollment.DeletedEnrollmentDate.isoformat() if enrollment.DeletedEnrollmentDate else None
                     cancelled_enrollments.append(enrollment_data)
             
-            # 5. حساب الحد الأقصى للساعات المسموحة
             average_gpa = CourseEnrollmentService._calculate_average_gpa(student)
             max_credits = 18 if average_gpa and average_gpa >= 2.0 else 10
             
@@ -2132,23 +2288,19 @@ class CourseEnrollmentService:
     
     @staticmethod
     def _calculate_average_gpa(student):
-        """حساب متوسط GPA لجميع الترمات مع حالة استثنائية للطلاب الجدد"""
         try:
-            # حالة استثنائية: الطلاب في الترم الأول فقط يُسمح لهم بـ 18 ساعة
             if hasattr(student, 'Semester') and student.Semester == 1:
-                return 2.0  # إرجاع قيمة تسمح بـ 18 ساعة
+                return 2.0  
             
             gpa_values = []
             
-            # جمع جميع قيم GPA من الترمات المختلفة
-            for i in range(1, 9):  # GPA1 إلى GPA8
+            for i in range(1, 9):  
                 gpa_attr = f'GPA{i}'
                 if hasattr(student, gpa_attr):
                     gpa_value = getattr(student, gpa_attr)
                     if gpa_value is not None and gpa_value > 0:
                         gpa_values.append(float(gpa_value))
             
-            # حساب المتوسط
             if gpa_values:
                 return sum(gpa_values) / len(gpa_values)
             else:
@@ -2156,14 +2308,12 @@ class CourseEnrollmentService:
                 
         except Exception as e:
             logger.error(f"Error in _calculate_average_gpa: {str(e)}")
-            # في حالة الخطأ، إذا كان طالب في الترم الأول فقط نسمح بـ 18 ساعة
             if hasattr(student, 'Semester') and student.Semester == 1:
                 return 2.0
             return None
     
     @staticmethod
     def _check_enrollment_period():
-        """التحقق من فترة التسجيل النشطة"""
         try:
             current_date = datetime.now()
             current_period = EnrollmentPeriods.query.filter(
@@ -2178,7 +2328,6 @@ class CourseEnrollmentService:
                     "period": current_period
                 }
             else:
-                # التحقق من وجود فترة قادمة
                 future_period = EnrollmentPeriods.query.filter(
                     EnrollmentPeriods.StartDate > current_date
                 ).order_by(EnrollmentPeriods.StartDate).first()
@@ -2203,34 +2352,25 @@ class CourseEnrollmentService:
     
     @staticmethod
     def _get_current_semester():
-        """الحصول على الفصل الدراسي الحالي"""
         current_date = datetime.now()
         current_month = current_date.month
         current_year = current_date.year
         
-        # تحديد الفصل الدراسي بناءً على الشهر
         if 2 <= current_month < 6:
-            # الفصل الربيعي
             return f"ربيع {current_year}"
         elif 9 <= current_month <= 12:
-            # الفصل الخريفي
             return f"خريف {current_year}"
         elif current_month == 1:
-            # الفصل الخريفي من العام السابق
             return f"شتاء {current_year - 1}"
         else:
-            # الفصل الصيفي
             return f"صيف {current_year}"
     
     @staticmethod
     def _check_credit_limit(student, course, current_semester):
-        """التحقق من الحد الأقصى للساعات المسموحة للطالب"""
         try:
-            # تحديد الحد الأقصى للساعات بناءً على متوسط GPA
             average_gpa = CourseEnrollmentService._calculate_average_gpa(student)
             max_credits = 18 if average_gpa and average_gpa >= 2.0 else 10
             
-            # حساب الساعات المسجلة حالياً في الفصل
             current_enrollments = Enrollments.query.filter_by(
                 StudentId=student.Id,
                 Semester=current_semester,
@@ -2243,12 +2383,10 @@ class CourseEnrollmentService:
                 if enrolled_course:
                     current_credits += enrolled_course.Credits or 0
             
-            # التحقق من إمكانية إضافة المادة الجديدة
             new_course_credits = course.Credits or 0
             total_credits_after = current_credits + new_course_credits
             
             if total_credits_after > max_credits:
-                # تحديد سبب الحد الأقصى للساعات
                 if hasattr(student, 'Semester') and student.Semester == 1:
                     gpa_reason = "(طالب في الترم الأول)"
                 elif average_gpa and average_gpa >= 2.0:
@@ -2277,9 +2415,7 @@ class CourseEnrollmentService:
     
     @staticmethod
     def _check_course_availability(student_id, course_id):
-        """التحقق من أن المادة متاحة للطالب"""
         try:
-            # 1. التحقق الأساسي: هل المادة موجودة؟
             course = Courses.query.get(course_id)
             if not course:
                 return {
@@ -2287,14 +2423,12 @@ class CourseEnrollmentService:
                     "message": "المادة غير موجودة"
                 }
             
-            # 2. التحقق من حالة المادة
             if hasattr(course, 'Status') and course.Status != 'متاح':
                 return {
                     "available": False,
                     "message": "المادة غير متاحة حالياً"
                 }
             
-            # 3. الحصول على بيانات الطالب
             student = Students.query.get(student_id)
             if not student:
                 return {
@@ -2302,7 +2436,6 @@ class CourseEnrollmentService:
                     "message": "الطالب غير موجود"
                 }
             
-            # 4. التحقق من أن المادة متاحة لشعبة الطالب
             division_check = CourseEnrollmentService._check_course_division_availability(student.DivisionId, course_id)
             if not division_check["available"]:
                 return {
@@ -2310,7 +2443,6 @@ class CourseEnrollmentService:
                     "message": division_check["message"]
                 }
             
-            # 5. التحقق من المتطلبات السابقة (Prerequisites)
             prerequisite_check = CourseEnrollmentService._check_prerequisites(student_id, course_id)
             if not prerequisite_check["satisfied"]:
                 return {
@@ -2318,12 +2450,19 @@ class CourseEnrollmentService:
                     "message": prerequisite_check["message"]
                 }
             
-            # 6. التحقق من السعة المتاحة للمادة
-            if hasattr(course, 'MaxSeats') and hasattr(course, 'CurrentEnrolledStudents'):
-                if course.MaxSeats and course.CurrentEnrolledStudents >= course.MaxSeats:
+            if hasattr(course, 'MaxSeats') and course.MaxSeats:
+                current_semester = CourseEnrollmentService._get_current_semester()
+                
+                current_enrolled_count = Enrollments.query.filter_by(
+                    CourseId=course_id,
+                    Semester=current_semester,
+                    IsCompleted="قيد الدراسة"
+                ).count()
+                
+                if current_enrolled_count >= course.MaxSeats:
                     return {
                         "available": False,
-                        "message": "المادة مكتملة العدد"
+                        "message": f"المادة مكتملة العدد ({current_enrolled_count}/{course.MaxSeats})"
                     }
             
             return {
@@ -2340,9 +2479,7 @@ class CourseEnrollmentService:
     
     @staticmethod
     def _check_course_division_availability(division_id, course_id):
-        """التحقق من أن المادة متاحة لشعبة الطالب من جدول CourseDivisions"""
         try:
-            # البحث عن المادة في جدول CourseDivisions للشعبة المحددة
             course_division = CourseDivisions.query.filter_by(
                 CourseId=course_id,
                 DivisionId=division_id
@@ -2354,7 +2491,6 @@ class CourseEnrollmentService:
                     "message": "المادة غير متاحة لشعبة الطالب"
                 }
             
-            # المادة متاحة للشعبة سواء كانت إجبارية أو اختيارية
             return {
                 "available": True,
                 "message": "المادة متاحة لشعبة الطالب"
@@ -2369,19 +2505,15 @@ class CourseEnrollmentService:
     
     @staticmethod
     def _check_prerequisites(student_id, course_id):
-        """التحقق من المتطلبات السابقة للمادة من جدول CoursePrerequisites"""
         try:
-            # الحصول على جميع المتطلبات السابقة للمادة
             prerequisites = CoursePrerequisites.query.filter_by(CourseId=course_id).all()
             
             if not prerequisites:
-                # لا توجد متطلبات سابقة
                 return {
                     "satisfied": True,
                     "message": "لا توجد متطلبات سابقة للمادة"
                 }
             
-            # الحصول على المواد المكتملة للطالب
             completed_enrollments = Enrollments.query.filter_by(
                 StudentId=student_id,
                 IsCompleted="مكتملة"
@@ -2389,12 +2521,10 @@ class CourseEnrollmentService:
             
             completed_course_ids = [enrollment.CourseId for enrollment in completed_enrollments]
             
-            # التحقق من كل متطلب سابق
             missing_prerequisites = []
             
             for prerequisite in prerequisites:
                 if prerequisite.PrerequisiteCourseId not in completed_course_ids:
-                    # الحصول على اسم المادة المطلوبة
                     required_course = Courses.query.get(prerequisite.PrerequisiteCourseId)
                     course_name = required_course.Name if required_course else f"المادة رقم {prerequisite.PrerequisiteCourseId}"
                     missing_prerequisites.append(course_name)
@@ -2419,21 +2549,17 @@ class CourseEnrollmentService:
     
     @staticmethod
     def _get_current_semester_number():
-        """الحصول على رقم الفصل الدراسي الحالي"""
         current_date = datetime.now()
         current_month = current_date.month
         
-        # تحديد رقم الفصل الدراسي بناءً على الشهر
         if 2 <= current_month <= 6:
-            # الفصل الربيعي
             return 2
         elif 9 <= current_month <= 12 or current_month == 1:
-            # الفصل الخريفي
             return 1
         else:
-            # الفصل الصيفي
             return 3
     
+
 
 class AcademicWarningService:
     
@@ -2847,9 +2973,7 @@ class AcademicWarningService:
         return gpa_history
 
     def _should_issue_warning(self, student, warning):
-        """تحديد ما إذا كان يجب إصدار الإنذار أم لا (منع التكرار)"""
         try:
-            # فحص إذا كان يوجد إنذار مشابه نشط
             existing_warning = AcademicWarnings.query.filter(
                 and_(
                     AcademicWarnings.StudentId == student.Id,
@@ -2859,25 +2983,20 @@ class AcademicWarningService:
             ).first()
             
             if existing_warning:
-                # إذا كان الإنذار الجديد أعلى مستوى، يتم إصداره
                 if warning['level'] > existing_warning.WarningLevel:
                     return True
-                # إذا كان نفس المستوى أو أقل، لا يتم إصداره
                 else:
                     self.logger.info(f"إنذار مشابه موجود بالفعل للطالب {student.Name}: {warning['type']} - المستوى {existing_warning.WarningLevel}")
                     return False
             
-            # إذا لم يوجد إنذار مشابه، يتم إصداره
             return True
             
         except Exception as e:
             self.logger.error(f"خطأ في فحص تكرار الإنذارات: {str(e)}")
-            return True  # في حالة الخطأ، يتم إصدار الإنذار احتياطياً
+            return True  
 
     def _create_warning(self, student, warning, semester):
-        """إنشاء إنذار أكاديمي جديد"""
         try:
-            # Close any existing active warnings of the same type
             existing_warnings = AcademicWarnings.query.filter(
                 and_(
                     AcademicWarnings.StudentId == student.Id,
@@ -2890,7 +3009,6 @@ class AcademicWarningService:
                 existing.Status = 'Superseded'
                 existing.ResolvedDate = datetime.now()
             
-            # إعداد الملاحظات مع تفاصيل المواد الراسب فيها إن وجدت
             notes = f"تم إصدار الإنذار تلقائياً بواسطة النظام"
             if 'failed_courses' in warning and warning['failed_courses']:
                 failed_courses_info = []
@@ -2903,7 +3021,6 @@ class AcademicWarningService:
                 
                 notes += f"\n\nالمواد الراسب فيها:\n" + "\n".join(failed_courses_info)
             
-            # Create new warning
             new_warning = AcademicWarnings(
                 StudentId=student.Id,
                 WarningType=warning['type'],
@@ -2926,7 +3043,6 @@ class AcademicWarningService:
             self.logger.error(f"خطأ في إنشاء الإنذار: {str(e)}")
 
     def resolve_warning(self, warning_id, notes=""):
-        """حل الإنذار الأكاديمي"""
         try:
             warning = AcademicWarnings.query.get(warning_id)
             if warning:
@@ -2941,7 +3057,6 @@ class AcademicWarningService:
         return False
 
     def get_student_warnings(self, student_id, status=None):
-        """الحصول على إنذارات طالب معين"""
         try:
             query = AcademicWarnings.query.filter_by(StudentId=student_id)
             if status:
@@ -2954,7 +3069,6 @@ class AcademicWarningService:
             return []
 
     def get_all_active_warnings(self):
-        """الحصول على جميع الإنذارات النشطة"""
         try:
             warnings = AcademicWarnings.query.filter_by(Status='نشط').order_by(
                 AcademicWarnings.WarningLevel.desc(),
@@ -2966,7 +3080,6 @@ class AcademicWarningService:
             return []
 
     def get_current_semester(self):
-        """الحصول على الفصل الدراسي الحالي"""
         from datetime import datetime
         now = datetime.now()
         if now.month >= 9 or now.month <= 1:
@@ -2977,13 +3090,11 @@ class AcademicWarningService:
             return f"صيف {now.year}"
 
     def check_and_resolve_warnings(self, student_id):
-        """فحص وحل الإنذارات تلقائياً عند تحسن الأداء"""
         try:
             student = Students.query.get(student_id)
             if not student:
                 return False
             
-            # الحصول على الإنذارات النشطة للطالب
             active_warnings = AcademicWarnings.query.filter(
                 and_(
                     AcademicWarnings.StudentId == student_id,
@@ -2997,9 +3108,7 @@ class AcademicWarningService:
                 should_resolve = False
                 resolution_reason = ""
                 
-                # فحص إنذارات الرسوب
                 if warning.WarningType == 'رسوب في المواد':
-                    # إعادة حساب المواد الراسب فيها حالياً
                     current_warnings = self._evaluate_student_warnings(student, self.get_current_semester())
                     failing_warning = None
                     
@@ -3008,7 +3117,6 @@ class AcademicWarningService:
                             failing_warning = w
                             break
                     
-                    # إذا لم يعد هناك إنذار رسوب أو انخفض مستواه بشكل كبير
                     if not failing_warning:
                         should_resolve = True
                         resolution_reason = "تم النجاح في جميع المواد المطلوبة"
@@ -3016,7 +3124,6 @@ class AcademicWarningService:
                         should_resolve = True
                         resolution_reason = f"تحسن الأداء - انخفض عدد المواد الراسب فيها"
                 
-                # فحص إنذارات المعدل التراكمي
                 elif warning.WarningType == 'انخفاض المعدل التراكمي':
                     current_gpa = self._get_current_gpa(student)
                     if current_gpa and current_gpa >= 2.5:
@@ -3026,7 +3133,6 @@ class AcademicWarningService:
                         should_resolve = True
                         resolution_reason = f"تحسن المعدل التراكمي إلى {current_gpa:.2f}"
                 
-                # فحص إنذارات الساعات المعتمدة
                 elif 'الساعات المعتمدة' in warning.WarningType:
                     credit_warning = self._check_credit_progress(student)
                     if not credit_warning:
@@ -3036,7 +3142,6 @@ class AcademicWarningService:
                         should_resolve = True
                         resolution_reason = "تحسن في عدد الساعات المكتملة"
                 
-                # حل الإنذار إذا كان مطلوباً
                 if should_resolve:
                     warning.Status = 'محلول'
                     warning.ResolvedDate = datetime.now()
@@ -3054,18 +3159,19 @@ class AcademicWarningService:
             self.logger.error(f"خطأ في فحص وحل الإنذارات: {str(e)}")
             return 0
 
+
+
+
+
 class AcademicStatusAnalysisService:
-    """خدمة تحليل الوضع الأكاديمي للطلاب"""
     
     @staticmethod
     def get_comprehensive_analysis(student_id: int) -> Dict:
-        """تحليل شامل للوضع الأكاديمي للطالب"""
         try:
             student = Students.query.get(student_id)
             if not student:
                 return {"error": "Student not found"}
             
-            # جمع جميع التحليلات
             basic_info = AcademicStatusAnalysisService._get_student_basic_info(student)
             gpa_trends = AcademicStatusAnalysisService._analyze_gpa_trends(student_id)
             performance_patterns = AcademicStatusAnalysisService._analyze_performance_patterns(student_id)
@@ -3078,8 +3184,7 @@ class AcademicStatusAnalysisService:
             interventions = AcademicStatusAnalysisService._predictive_intervention_system(student_id)
             ai_insights = AcademicStatusAnalysisService._generate_ai_insights(student_id)
             
-            # إزالة التكرارات
-            # إزالة current_gpa من التحليلات الأخرى لأنه موجود في basic_info
+            
             if 'current_gpa' in gpa_trends:
                 del gpa_trends['current_gpa']
             if 'current_gpa' in risk_assessment:
@@ -3087,7 +3192,6 @@ class AcademicStatusAnalysisService:
             if 'current_gpa' in predictions:
                 del predictions['current_gpa']
             
-            # إزالة gpa_history من predictions لأنه موجود في gpa_analysis
             if 'gpa_history' in predictions:
                 del predictions['gpa_history']
             
@@ -3122,13 +3226,11 @@ class AcademicStatusAnalysisService:
     
     @staticmethod
     def _analyze_gpa_trends(student_id: int) -> Dict:
-        """تحليل اتجاهات المعدل التراكمي"""
         try:
             student = Students.query.get(student_id)
             if not student:
                 return {"error": "Student not found"}
             
-            # الطالب في الترم X يعني أنه أكمل الترم X-1
             completed_semester = student.Semester - 1
             
             if completed_semester <= 0:
@@ -3139,7 +3241,6 @@ class AcademicStatusAnalysisService:
                     "interpretation": "الطالب لم يكمل أي فصل دراسي بعد"
                 }
             
-            # جمع معدلات الفصول المكتملة وحساب المعدل التراكمي
             gpa_history = []
             cumulative_gpas = []
             semesters = []
@@ -3151,7 +3252,6 @@ class AcademicStatusAnalysisService:
                 if semester_gpa is not None:
                     gpa_history.append(float(semester_gpa))
                     total_gpa += float(semester_gpa)
-                    # المعدل التراكمي حتى هذا الفصل
                     cumulative_gpa = total_gpa / i
                     cumulative_gpas.append(cumulative_gpa)
                     semesters.append(i)
@@ -3164,7 +3264,6 @@ class AcademicStatusAnalysisService:
                     "interpretation": "بيانات غير كافية لتحديد الاتجاه"
                 }
             
-            # حساب الاتجاه باستخدام الانحدار الخطي
             X = np.array(semesters).reshape(-1, 1)
             y = np.array(cumulative_gpas)
             
@@ -3172,7 +3271,6 @@ class AcademicStatusAnalysisService:
             model.fit(X, y)
             slope = model.coef_[0]
             
-            # تحديد الاتجاه
             if slope > 0.1:
                 trend = "متحسن"
             elif slope < -0.1:
@@ -3219,24 +3317,20 @@ class AcademicStatusAnalysisService:
     
     @staticmethod
     def _analyze_performance_patterns(student_id: int) -> Dict:
-        """تحليل أنماط الأداء الأكاديمي"""
         try:
             enrollments = Enrollments.query.filter_by(StudentId=student_id).all()
             if not enrollments:
                 return {"error": "No enrollment data found"}
             
-            # تحليل الأداء حسب الفصل الدراسي
             semester_performance = {}
             for enrollment in enrollments:
                 if (enrollment.Grade is not None and 
                     enrollment.Exam1Grade is not None and 
                     enrollment.Exam2Grade is not None):
                     
-                    # حساب الدرجة الإجمالية من 150
                     total_grade = (float(enrollment.Exam1Grade) + 
                                  float(enrollment.Exam2Grade) + 
                                  float(enrollment.Grade))
-                    # تحويل إلى نسبة مئوية
                     percentage = (total_grade / 150.0) * 100
                     
                     semester = enrollment.Semester
@@ -3244,12 +3338,10 @@ class AcademicStatusAnalysisService:
                         semester_performance[semester] = []
                     semester_performance[semester].append(percentage)
             
-            # حساب متوسط كل فصل مع التقريب
             semester_averages = {}
             for semester, grades in semester_performance.items():
                 semester_averages[semester] = round(statistics.mean(grades), 2)
             
-            # تحليل الأداء حسب عدد الساعات المعتمدة
             credits_performance = {}
             for enrollment in enrollments:
                 if (enrollment.Grade is not None and 
@@ -3257,7 +3349,6 @@ class AcademicStatusAnalysisService:
                     enrollment.Exam2Grade is not None and
                     hasattr(enrollment, 'course') and enrollment.course):
                     
-                    # حساب الدرجة الإجمالية من 150
                     total_grade = (float(enrollment.Exam1Grade) + 
                                  float(enrollment.Exam2Grade) + 
                                  float(enrollment.Grade))
@@ -3268,17 +3359,14 @@ class AcademicStatusAnalysisService:
                         credits_performance[credits] = []
                     credits_performance[credits].append(percentage)
             
-            # حساب متوسط الأداء حسب الساعات المعتمدة مع التقريب
             credits_averages = {}
             for credits, grades in credits_performance.items():
                 credits_averages[credits] = round(statistics.mean(grades), 2)
             
-            # تحديد النمط العام
             pattern = AcademicStatusAnalysisService._identify_performance_patterns(
                 semester_averages, credits_averages
             )
             
-            # إضافة تحليل أكثر تفصيلاً
             analysis_details = AcademicStatusAnalysisService._generate_performance_insights(
                 semester_averages, credits_averages, pattern
             )
@@ -3301,11 +3389,9 @@ class AcademicStatusAnalysisService:
     
     @staticmethod
     def _generate_performance_insights(semester_averages: Dict, credits_averages: Dict, pattern: str) -> Dict:
-        """توليد رؤى مفصلة حول الأداء"""
         insights = {}
         
         try:
-            # تحليل الفصول الدراسية
             if semester_averages:
                 semester_values = list(semester_averages.values())
                 insights["semester_analysis"] = {
@@ -3318,7 +3404,6 @@ class AcademicStatusAnalysisService:
                     "consistency": "مستقر" if statistics.variance(semester_values) < 25 else "متذبذب"
                 }
             
-            # تحليل الساعات المعتمدة
             if credits_averages:
                 insights["credits_analysis"] = {
                     "performance_by_load": credits_averages,
@@ -3340,7 +3425,6 @@ class AcademicStatusAnalysisService:
     
     @staticmethod
     def _explain_optimal_load(credits_averages: Dict) -> str:
-        """شرح العبء الدراسي الأمثل"""
         if not credits_averages:
             return "لا توجد بيانات كافية لتحديد العبء الأمثل"
         
@@ -3802,8 +3886,7 @@ class AcademicStatusAnalysisService:
     
     @staticmethod
     def _analyze_component_balance(exam1_avg: float, exam2_avg: float, coursework_avg: float) -> str:
-        """تحليل توازن مكونات الدرجة"""
-        # تحويل إلى نسب مئوية للمقارنة
+       
         exam1_pct = (exam1_avg / 30) * 100
         exam2_pct = (exam2_avg / 30) * 100
         coursework_pct = (coursework_avg / 90) * 100
@@ -3821,7 +3904,6 @@ class AcademicStatusAnalysisService:
     
     @staticmethod
     def _compare_with_class_average(student_avg: float, peer_avg: float) -> Dict:
-        """مقارنة مفصلة مع متوسط الفصل"""
         difference = student_avg - peer_avg
         
         if difference > 15:
@@ -3851,10 +3933,8 @@ class AcademicStatusAnalysisService:
     
     @staticmethod
     def _generate_course_suggestions(detailed_analysis: Dict, comparison: Dict) -> List[str]:
-        """توليد اقتراحات تحسين للمادة"""
         suggestions = []
         
-        # اقتراحات حسب نقاط الضعف
         strengths_weaknesses = detailed_analysis.get("strengths_weaknesses", {})
         weakest = strengths_weaknesses.get("weakest_component", {})
         
@@ -4014,9 +4094,7 @@ class AcademicStatusAnalysisService:
     
     @staticmethod
     def _get_warnings_summary(student_id: int) -> Dict:
-        """ملخص سريع للإنذارات الأكاديمية"""
         try:
-            # البحث عن الإنذارات في جدول AcademicWarnings
             warnings = AcademicWarnings.query.filter_by(StudentId=student_id).all()
             
             if not warnings:
@@ -4028,7 +4106,6 @@ class AcademicStatusAnalysisService:
                     "last_warning_date": None
                 }
             
-            # حساب الإنذارات النشطة
             active_warnings_count = 0
             last_warning_date = None
             
@@ -4037,14 +4114,12 @@ class AcademicStatusAnalysisService:
                 if not is_resolved:
                     active_warnings_count += 1
                 
-                # تحديث تاريخ آخر إنذار
                 if warning.IssueDate:
                     if last_warning_date is None or warning.IssueDate > last_warning_date:
                         last_warning_date = warning.IssueDate
             
             total_warnings = len(warnings)
             
-            # تحديد مستوى المخاطرة والحالة الحالية
             if active_warnings_count == 0:
                 risk_level = "آمن"
                 current_status = f"تم حل جميع الإنذارات ({total_warnings} إنذار سابق)" if total_warnings > 0 else "لا توجد إنذارات"
@@ -4071,18 +4146,15 @@ class AcademicStatusAnalysisService:
     
     @staticmethod
     def _compare_with_peers(student_id: int) -> Dict:
-        """مقارنة مبسطة للطالب مع زملائه في نفس الشعبة والترم"""
         try:
             student = Students.query.get(student_id)
             if not student:
                 return {"error": "Student not found"}
             
-            # الحصول على معلومات الطالب الأساسية
             student_division = student.DivisionId
             student_semester = student.Semester
             student_current_gpa = AcademicStatusAnalysisService._get_current_gpa(student)
             
-            # جلب الطلاب في نفس الشعبة والترم
             peers = Students.query.filter(
                 Students.DivisionId == student_division,
                 Students.Semester == student_semester,
@@ -4111,13 +4183,12 @@ class AcademicStatusAnalysisService:
                     ]
                 }
             
-            # حساب المعدلات التراكمية للزملاء
             peer_gpas = []
             peer_data = []
             
             for peer in peers:
                 peer_gpa = AcademicStatusAnalysisService._get_current_gpa(peer)
-                if peer_gpa > 0:  # تجاهل الطلاب بدون معدل
+                if peer_gpa > 0:  
                     peer_gpas.append(peer_gpa)
                     peer_data.append({
                         "student_id": peer.Id,
@@ -5500,1933 +5571,2831 @@ class AcademicStatusAnalysisService:
             ])
         
         return strategies 
-class AcademicPathService:
-    """خدمة التخطيط الأكاديمي للمسارات"""
+
+
+
+
+
+
+
+
+
+
+
+
+class AcademicPathPlanningService:
+    """خدمة التخطيط الأكاديمي المحسنة للسرعة"""
     
     def __init__(self):
-        # خريطة التشعيبات والمسارات
-        self.path_mapping = {
-            # مسار العلوم الطبيعية
-            '1030': {'path': 'العلوم الطبيعية', 'stage': 'السنة الأولى', 'level': 1},
-            '1035': {'path': 'العلوم الطبيعية', 'stage': 'الرياضيات والفيزياء', 'level': 2},
-            '1095': {'path': 'العلوم الطبيعية', 'stage': 'الكيمياء والفيزياء', 'level': 2},
-            '1040': {'path': 'العلوم الطبيعية', 'stage': 'الرياضيات الخاصة', 'level': 3},
-            '1045': {'path': 'العلوم الطبيعية', 'stage': 'الفيزياء الخاصة', 'level': 3},
-            '1050': {'path': 'العلوم الطبيعية', 'stage': 'الرياضيات وعلوم الحاسب', 'level': 3},
-            '1055': {'path': 'العلوم الطبيعية', 'stage': 'الكيمياء الخاصة', 'level': 3},
-            
-            # مسار العلوم البيولوجية
-            '1085': {'path': 'العلوم البيولوجية', 'stage': 'العلوم البيولوجية والكيميائية', 'level': 1},
-            '1060': {'path': 'العلوم البيولوجية', 'stage': 'علم الحيوان', 'level': 3},
-            '1065': {'path': 'العلوم البيولوجية', 'stage': 'النبات والكيمياء', 'level': 3},
-            '1070': {'path': 'العلوم البيولوجية', 'stage': 'علم الحيوان والكيمياء', 'level': 3},
-            '1075': {'path': 'العلوم البيولوجية', 'stage': 'الكيمياء والكيمياء الحيوية', 'level': 3},
-            
-            # مسار العلوم الجيولوجية
-            '1090': {'path': 'العلوم الجيولوجية', 'stage': 'العلوم الجيولوجية والكيميائية', 'level': 1},
-            '1080': {'path': 'العلوم الجيولوجية', 'stage': 'الجيولوجيا والكيمياء', 'level': 3}
+        # نظام الشعب والتشعيبات - محسن
+        self.specialization_system = {
+            'مجموعة العلوم البيولوجية والكيميائية': {
+                'intermediate_specializations': ['الأحياء', 'الكيمياء', 'الكيمياء الحيوية'],
+                'final_specializations': {
+                    'الأحياء': ['علم الحيوان', 'علم النبات', 'علم الأحياء الدقيقة'],
+                    'الكيمياء': ['الكيمياء التحليلية', 'الكيمياء العضوية', 'الكيمياء غير العضوية'],
+                    'الكيمياء الحيوية': ['الكيمياء الحيوية الطبية', 'الكيمياء الحيوية الجزيئية']
+                }
+            },
+            'مجموعة العلوم الجيولوجية والكيميائية': {
+                'intermediate_specializations': ['الجيولوجيا', 'الكيمياء'],
+                'final_specializations': {
+                    'الجيولوجيا': ['الجيولوجيا التطبيقية', 'الجيولوجيا البيئية'],
+                    'الكيمياء': ['الكيمياء التحليلية', 'الكيمياء الصناعية']
+                }
+            },
+            'مجموعة العلوم الطبيعية': {
+                'intermediate_specializations': ['الفيزياء', 'الرياضيات'],
+                'final_specializations': {
+                    'الفيزياء': ['الفيزياء النظرية', 'الفيزياء التطبيقية'],
+                    'الرياضيات': ['الرياضيات البحتة', 'الرياضيات التطبيقية']
+                }
+            }
         }
         
-        # خريطة الانتقالات المسموحة
-        self.transition_map = {
-            '1030': ['1035', '1095'],  # من العلوم الطبيعية السنة الأولى
-            '1035': ['1040', '1045', '1035', '1050'],  # من الرياضيات والفيزياء
-            '1095': ['1055', '1095'],  # من الكيمياء والفيزياء
-            '1085': ['1060', '1065', '1070', '1075'],  # من العلوم البيولوجية
-            '1090': ['1080']  # من العلوم الجيولوجية
-        }
-    
-    def get_student_academic_path(self, student_id):
-        """الحصول على المسار الأكاديمي الكامل للطالب"""
-        student = Students.query.get(student_id)
+        # إعدادات الكاش المحسنة - إضافة الكاش المفقود
+        self._cache = {}
+        self._cache_timeout = 300  # 5 دقائق
+        self._performance_cache = {}  # كاش الأداء المفقود
+        self._student_cache = {}      # كاش بيانات الطلاب  
+        self._courses_cache = {}      # كاش المقررات
+
+    # تحسين جذري لاستعلامات قاعدة البيانات
+    @lru_cache(maxsize=200)
+    def _get_student_data_bulk(self, student_id):
+        """استعلام واحد شامل لكل بيانات الطالب - محسن جداً"""
+        from models import Students, Enrollments
+        
+        # استعلام واحد يجلب كل شيء
+        student = db.session.query(Students)\
+            .options(joinedload(Students.division))\
+            .filter_by(Id=student_id)\
+            .first()
+            
         if not student:
             return None
+            
+        # جلب التسجيلات مع المقررات في استعلام واحد
+        enrollments = db.session.query(Enrollments)\
+            .options(joinedload(Enrollments.course))\
+            .filter_by(StudentId=student_id)\
+            .all()
+            
+        return {
+            'student': student,
+            'enrollments': enrollments,
+            'division': student.division
+        }
+
+    @lru_cache(maxsize=50)
+    def _get_all_division_data_bulk(self, division_id):
+        """جلب كل بيانات الشعبة في استعلام واحد - محسن جداً"""
+        # استعلام واحد شامل
+        course_divisions = db.session.query(CourseDivisions)\
+            .options(
+                joinedload(CourseDivisions.course).joinedload(Courses.department),
+                joinedload(CourseDivisions.division)
+            )\
+            .filter_by(DivisionId=division_id)\
+            .all()
+            
+        courses_data = []
+        for cd in course_divisions:
+            course = cd.course
+            department = course.department
+            courses_data.append({
+                'course_id': course.Id,
+                'name': course.Name,
+                'code': course.Code,
+                'credits': course.Credits,
+                'semester': course.Semester,
+                'is_mandatory': cd.IsMandatory,
+                'description': course.Description,
+                'department_id': course.DepartmentId,
+                'department_name': department.Name,
+                'subject_type': self._determine_subject_type_cached(department.Name.lower(), course.Name.lower())
+            })
+            
+        return courses_data
+
+    def _get_completed_course_ids_fast(self, enrollments):
+        """استخراج المقررات المكتملة من البيانات الموجودة - سريع جداً"""
+        completed_ids = []
+        for enroll in enrollments:
+            if enroll.Grade:
+                # تحويل الدرجة إلى نص للتعامل مع Decimal objects
+                grade_str = str(enroll.Grade).upper()
+                if grade_str not in ['F', 'W', 'I']:
+                    completed_ids.append(enroll.CourseId)
+        return completed_ids
+
+    def get_academic_plan(self, student_id):
+        """الحصول على الخطة الأكاديمية الشاملة للطالب - محسن جذرياً"""
+        start_time = time.time()
         
-        # تحديد المسار الأكاديمي
-        current_path = self._determine_academic_path(student)
+        try:
+            # جلب كل البيانات في استعلام واحد - تحسين جذري
+            student_data = self._get_student_data_bulk(student_id)
+            if not student_data:
+                return self._error_response('الطالب غير موجود')
+            
+            student = student_data['student']
+            enrollments = student_data['enrollments']
+            division = student_data['division']
+            
+            # معلومات الشعبة من الكاش المحسن
+            division_info = {
+                'division_name': division.Name,
+                'division_id': division.Id
+            }
+            
+            # جلب المقررات المتاحة - محسن
+            available_courses = self._get_all_division_data_bulk(division.Id)
+            completed_course_ids = self._get_completed_course_ids_fast(enrollments)
+            
+            # حساب المعدل من البيانات الموجودة - بدون استعلام إضافي
+            gpa = self._calculate_gpa_from_enrollments(enrollments)
+            max_credits = self._get_max_credits(gpa)
+            
+            plan = None
+            
+            # تحديد نوع الخطة حسب الشعبة - محسن
+            if division.Name in ['مجموعة العلوم البيولوجية والكيميائية', 
+                                'مجموعة العلوم الجيولوجية والكيميائية']:
+                plan = self._create_optimized_biology_geology_plan(
+                    student, division_info, available_courses, completed_course_ids, max_credits
+                )
+            elif division.Name == 'مجموعة العلوم الطبيعية':
+                plan = self._create_optimized_natural_sciences_plan(
+                    student, division_info, available_courses, completed_course_ids, max_credits
+                )
+            
+            if plan:
+                # تسجيل الوقت المستغرق
+                end_time = time.time()
+                execution_time = round(end_time - start_time, 2)
+                plan['performance_info'] = {
+                    'execution_time_seconds': execution_time,
+                    'optimization_level': 'high',
+                    'database_queries_reduced': True
+                }
+                
+                return plan
+            else:
+                return self._error_response('نوع الشعبة غير مدعوم')
+                
+        except Exception as e:
+            return self._error_response(f'خطأ في إنشاء الخطة الأكاديمية: {str(e)}')
+
+    def _calculate_gpa_from_enrollments(self, enrollments):
+        """حساب المعدل من التسجيلات مباشرة - بدون استعلام"""
+        total_points = 0
+        total_credits = 0
         
-        # حساب التقدم
-        progress = self._calculate_student_progress(student)
+        grade_points = {
+            'A+': 4.0, 'A': 4.0, 'A-': 3.7,
+            'B+': 3.3, 'B': 3.0, 'B-': 2.7,
+            'C+': 2.3, 'C': 2.0, 'C-': 1.7,
+            'D+': 1.3, 'D': 1.0, 'F': 0.0
+        }
         
-        # الخطة المستقبلية
-        future_plan = self._generate_future_plan(student, current_path)
+        for enrollment in enrollments:
+            if enrollment.Grade:
+                # تحويل الدرجة إلى نص للتعامل مع Decimal objects
+                grade_str = str(enrollment.Grade).strip()
+                if grade_str in grade_points:
+                    course_credits = enrollment.course.Credits if enrollment.course else 3
+                    total_credits += course_credits
+                    total_points += grade_points[grade_str] * course_credits
         
-        # التوصيات
-        recommendations = self._generate_recommendations(student)
+        return total_points / total_credits if total_credits > 0 else 0.0
+
+    def _create_optimized_biology_geology_plan(self, student, division_info, available_courses, completed_course_ids, max_credits):
+        """إنشاء خطة محسنة للعلوم البيولوجية والجيولوجية"""
+        current_semester = student.Semester
+        
+        # تحديد المرحلة الحالية
+        if current_semester <= 2:
+            stage = 'عام'
+        elif current_semester <= 4:
+            stage = 'تشعيب متوسط'
+        else:
+            stage = 'تخصص نهائي'
+        
+        # تصفية المقررات المتاحة - معالجة سريعة
+        available_courses_filtered = [
+            course for course in available_courses 
+            if course['course_id'] not in completed_course_ids
+        ]
+        
+        # إنشاء خطة الترمات
+        semester_plans = self._create_fast_semester_plans(
+            student, stage, current_semester, available_courses_filtered, max_credits
+        )
         
         return {
-            'student_info': self._get_student_basic_info(student),
-            'current_path': current_path,
-            'progress': progress,
-            'future_plan': future_plan,
-            'recommendations': recommendations
+            'message': 'تم إنشاء الخطة الأكاديمية بنجاح',
+            'status': 'success',
+            'student_info': {
+                'name': student.Name,
+                'student_id': student.Id,
+                'current_semester': current_semester,
+                'division': division_info['division_name'],
+                'current_stage': stage,
+                'max_credits_per_semester': max_credits
+            },
+            'semester_plans': semester_plans,
+            'total_remaining_semesters': len(semester_plans)
         }
-    
-    def _get_student_basic_info(self, student):
+
+    def _create_optimized_natural_sciences_plan(self, student, division_info, available_courses, completed_course_ids, max_credits):
+        """إنشاء خطة محسنة للعلوم الطبيعية"""
+        current_semester = student.Semester
+        
+        # تحديد المرحلة الحالية
+        if current_semester <= 2:
+            stage = 'عام'
+        elif current_semester <= 4:
+            stage = 'تشعيب متوسط'
+        else:
+            stage = 'تخصص نهائي'
+        
+        # تصفية المقررات - معالجة سريعة
+        available_courses_filtered = [
+            course for course in available_courses 
+            if course['course_id'] not in completed_course_ids
+        ]
+        
+        # إنشاء خطة الترمات
+        semester_plans = self._create_fast_semester_plans(
+            student, stage, current_semester, available_courses_filtered, max_credits
+        )
+        
+        return {
+            'message': 'تم إنشاء الخطة الأكاديمية بنجاح',
+            'status': 'success',
+            'student_info': {
+                'name': student.Name,
+                'student_id': student.Id,
+                'current_semester': current_semester,
+                'division': division_info['division_name'],
+                'current_stage': stage,
+                'max_credits_per_semester': max_credits
+            },
+            'semester_plans': semester_plans,
+            'total_remaining_semesters': len(semester_plans)
+        }
+
+    def _create_fast_semester_plans(self, student, stage, current_semester, available_courses, max_credits):
+        """إنشاء خطط الترمات بشكل سريع"""
+        semester_plans = {}
+        
+        # حساب عدد الترمات المتبقية
+        max_semesters = 8
+        remaining_semesters = max_semesters - current_semester
+        
+        # توزيع المقررات على الترمات - خوارزمية محسنة
+        courses_per_semester = self._distribute_courses_optimized(
+            available_courses, remaining_semesters, max_credits
+        )
+        
+        for i in range(remaining_semesters):
+            semester_number = current_semester + i + 1
+            if semester_number > max_semesters:
+                break
+                
+            semester_key = f'semester_{semester_number}'
+            courses = courses_per_semester.get(i, [])
+            
+            semester_plans[semester_key] = {
+                'semester_number': semester_number,
+                'semester_name': f'الترم {semester_number}',
+                'stage': stage,
+                'courses': courses,
+                'total_credits': sum(course.get('credits', 0) for course in courses),
+                'note': f'مقررات مرحلة {stage}'
+            }
+        
+        return semester_plans
+
+    def _distribute_courses_optimized(self, available_courses, remaining_semesters, max_credits):
+        """توزيع المقررات على الترمات بطريقة محسنة"""
+        if not available_courses or remaining_semesters <= 0:
+            return {}
+        
+        # ترتيب المقررات حسب الأولوية - معالجة سريعة
+        sorted_courses = sorted(
+            available_courses,
+            key=lambda x: (not x.get('is_mandatory', False), x.get('semester', 99), x.get('credits', 0))
+        )
+        
+        semester_plans = {}
+        course_index = 0
+        
+        for semester_idx in range(remaining_semesters):
+            current_credits = 0
+            semester_courses = []
+            
+            # إضافة المقررات للترم الحالي
+            while course_index < len(sorted_courses) and current_credits < max_credits:
+                course = sorted_courses[course_index]
+                course_credits = course.get('credits', 0)
+                
+                if current_credits + course_credits <= max_credits:
+                    semester_courses.append({
+                        'course_id': course['course_id'],
+                        'course_name': course['name'],
+                        'course_code': course['code'],
+                        'credits': course_credits
+                    })
+                    current_credits += course_credits
+                    course_index += 1
+                else:
+                    break
+            
+            semester_plans[semester_idx] = semester_courses
+            
+            # إذا انتهت المقررات، توقف
+            if course_index >= len(sorted_courses):
+                break
+        
+        return semester_plans
+
+    def _get_division_info(self, student):
+        """الحصول على معلومات الشعبة"""
+        division_name = student.division.Name
+        return self.specialization_system.get(division_name)
+
+    def _create_biology_geology_plan(self, student, division_info):
+        """إنشاء خطة للمسارات البيولوجية والجيولوجية"""
+        current_semester = student.Semester
+        student_gpa = self._calculate_student_gpa(student)
+        max_credits = self._get_max_credits(student_gpa)
+        
+        plan = {
+            'student_info': self._get_basic_student_info(student),
+            'current_gpa': student_gpa,
+            'max_credits_per_semester': max_credits,
+            'track_type': division_info['type'],
+            'current_stage': self._determine_current_stage_biology_geology(current_semester),
+            'plan': {}
+        }
+        
+        if current_semester <= 4:
+            # من الترم 1 إلى 4 - شعبة عامة
+            plan['plan'] = self._create_general_semesters_plan(student, current_semester, max_credits)
+            
+            # اقتراح التخصص في نهاية الترم 4
+            if current_semester == 4:
+                performance_analysis = self._analyze_student_performance(student)
+                specialization_recommendation = self._recommend_specialization(
+                    student, division_info['available_specializations'], performance_analysis
+                )
+                plan['specialization_recommendation'] = specialization_recommendation
+            else:
+                plan['specialization_recommendation'] = None
+            
+        else:
+            # من الترم 5 إلى 8 - متخصص
+            plan['plan'] = self._create_specialized_plan(student, current_semester, max_credits)
+            plan['specialization_recommendation'] = None
+            
+        return plan
+
+    def _create_natural_sciences_plan(self, student, division_info):
+        """إنشاء خطة لمسار العلوم الطبيعية"""
+        current_semester = student.Semester
+        student_gpa = self._calculate_student_gpa(student)
+        max_credits = self._get_max_credits(student_gpa)
+        
+        plan = {
+            'student_info': self._get_basic_student_info(student),
+            'current_gpa': student_gpa,
+            'max_credits_per_semester': max_credits,
+            'track_type': division_info['type'],
+            'current_stage': self._determine_current_stage_natural_sciences(current_semester),
+            'plan': {}
+        }
+        
+        if current_semester <= 2:
+            # السنة الأولى - شعبة عامة
+            if current_semester == 1:
+                plan['plan'] = self._create_semester_plan_until(student, 2, max_credits)
+            else:  # semester 2
+                intermediate_recommendation = self._recommend_intermediate_specialization(student)
+                plan['intermediate_specialization_recommendation'] = intermediate_recommendation
+                plan['plan'] = self._create_intermediate_specialization_plans(
+                    student, division_info['intermediate_specializations'], current_semester, max_credits
+                )
+                
+        elif current_semester <= 4:
+            # السنة الثانية - تشعيب متوسط
+            if current_semester == 3:
+                plan['plan'] = self._create_semester_plan_until(student, 4, max_credits)
+            else:  # semester 4
+                final_recommendation = self._recommend_final_specialization(student, division_info['final_specializations'], current_semester, max_credits)
+                plan['final_specialization_recommendation'] = final_recommendation
+                plan['plan'] = self._create_final_specialization_plans(
+                    student, division_info['final_specializations'], current_semester, max_credits
+                )
+                
+        else:
+            # السنة الثالثة والرابعة - تخصص نهائي
+            plan['plan'] = self._create_specialized_plan(student, current_semester, max_credits)
+            
+        return plan
+
+    def _create_intermediate_specialized_plan(self, student, division_info):
+        """إنشاء خطة للطلاب في التشعيب المتوسط (الرياضيات والفيزياء، الكيمياء والفيزياء)"""
+        current_semester = student.Semester
+        student_gpa = self._calculate_student_gpa(student)
+        max_credits = self._get_max_credits(student_gpa)
+        
+        plan = {
+            'student_info': self._get_basic_student_info(student),
+            'current_gpa': student_gpa,
+            'max_credits_per_semester': max_credits,
+            'track_type': division_info['type'],
+            'current_stage': f'التشعيب المتوسط - {student.division.Name}',
+            'plan': {}
+        }
+        
+        # إنشاء خطة للفصول المتبقية في التشعيب المتوسط
+        remaining_semesters = []
+        if current_semester == 3:
+            remaining_semesters = [4, 5]  # باقي التشعيب المتوسط + أول ترم تخصص نهائي
+        elif current_semester == 4:
+            remaining_semesters = [5]  # انتقال للتخصص النهائي
+            # إضافة توصية للتخصص النهائي
+            final_recommendation = self._recommend_final_specialization(student, division_info['final_specializations'], current_semester, max_credits)
+            plan['final_specialization_recommendation'] = final_recommendation
+        
+        for semester in remaining_semesters:
+            if semester <= 4:
+                # فصول التشعيب المتوسط
+                semester_courses = self._get_specialization_courses(
+                    student, student.division.Name, semester, max_credits
+                )
+                plan[f'semester_{semester}'] = {
+                    'semester_number': semester,
+                    'semester_name': f'الترم {semester} - {student.division.Name}',
+                    'courses': semester_courses,
+                    'total_credits': sum(course['credits'] for course in semester_courses)
+                }
+            else:
+                # الترم الأول للتخصص النهائي
+                plan[f'semester_{semester}'] = {
+                    'semester_number': semester,
+                    'semester_name': f'الترم {semester} - تخصص نهائي',
+                    'courses': [],
+                    'note': 'يتطلب اختيار التخصص النهائي أولاً'
+                }
+                
+        return plan
+
+    def _create_final_specialized_plan(self, student, division_info):
+        """إنشاء خطة للطلاب في التخصص النهائي"""
+        current_semester = student.Semester
+        student_gpa = self._calculate_student_gpa(student)
+        max_credits = self._get_max_credits(student_gpa)
+        
+        plan = {
+            'student_info': self._get_basic_student_info(student),
+            'current_gpa': student_gpa,
+            'max_credits_per_semester': max_credits,
+            'track_type': division_info['type'],
+            'current_stage': f'التخصص النهائي - {student.division.Name}',
+            'plan': {}
+        }
+        
+        # إنشاء خطة للفصول المتبقية حتى التخرج
+        for semester in range(current_semester + 1, 9):  # حتى الترم 8
+            semester_courses = self._get_specialization_courses(
+                student, student.division.Name, semester, max_credits
+            )
+            plan[f'semester_{semester}'] = {
+                'semester_number': semester,
+                'semester_name': f'الترم {semester} - {student.division.Name}',
+                'courses': semester_courses,
+                'total_credits': sum(course['credits'] for course in semester_courses),
+                'specialization': student.division.Name
+            }
+            
+        return plan
+
+    def _calculate_student_gpa(self, student):
+        """حساب متوسط GPA الطالب من حقول GPA1-GPA8 في جدول Students"""
+        try:
+            # جمع جميع قيم GPA التي ليست null
+            gpa_values = []
+            
+            # فحص كل حقل GPA من GPA1 إلى GPA8
+            for gpa_field in ['GPA1', 'GPA2', 'GPA3', 'GPA4', 'GPA5', 'GPA6', 'GPA7', 'GPA8']:
+                gpa_value = getattr(student, gpa_field, None)
+                if gpa_value is not None:
+                    gpa_values.append(float(gpa_value))
+            
+            # حساب المتوسط إذا كان هناك قيم
+            if gpa_values:
+                average_gpa = sum(gpa_values) / len(gpa_values)
+                return round(average_gpa, 2)
+            else:
+                return 0.0
+            
+        except Exception as e:
+            print(f"خطأ في حساب GPA للطالب {student.Id}: {e}")
+            return 0.0
+
+    def _get_max_credits(self, gpa):
+        """تحديد الحد الأقصى للساعات بناءً على GPA"""
+        if gpa < 2.0:
+            return 10
+        else:
+            return 18
+
+    def _get_basic_student_info(self, student):
         """معلومات الطالب الأساسية"""
         return {
             'id': student.Id,
             'name': student.Name,
             'current_semester': student.Semester,
-            'division_id': student.DivisionId,
-            'division_name': student.division.Name,
-            'credits_completed': student.CreditsCompleted,
-            'student_level': student.StudentLevel,
-            'status': student.status
+            'division': student.division.Name,
+            'credits_completed': student.CreditsCompleted or 0
         }
-    
-    def _determine_academic_path(self, student):
-        """تحديد المسار الأكاديمي بناءً على التشعيب الحالي"""
-        division_name = student.division.Name
-        
-        path_info = self.path_mapping.get(division_name, {
-            'path': 'غير محدد',
-            'stage': 'غير محدد',
-            'level': 0
-        })
-        
-        return {
-            'path_name': f"مسار {path_info['path']}",
-            'current_stage': path_info['stage'],
-            'stage_level': path_info['level'],
-            'division_code': division_name,
-            'division_display_name': self._get_division_display_name(division_name)
-        }
-    
-    def _calculate_student_progress(self, student):
-        """حساب تقدم الطالب مع مراعاة أن GPA لكل ترم منفصل"""
-        current_year = self._calculate_academic_year(student.Semester)
-        
-        # حساب المعدل التراكمي الصحيح
-        cumulative_gpa = self._calculate_cumulative_gpa(student)
-        
-        # الحصول على المقررات المكتملة
-        completed_courses = self._get_completed_courses(student.Id)
-        
-        # التشعيبات المتاحة للمرحلة القادمة
-        next_divisions = self._get_next_available_divisions(student)
-        
-        # تحليل الأداء الأكاديمي
-        academic_performance = self._analyze_academic_performance(student)
-        
-        return {
-            'current_year': current_year,
-            'current_semester': student.Semester,
-            'completed_courses_count': len(completed_courses),
-            'credits_completed': student.CreditsCompleted,
-            'cumulative_gpa': cumulative_gpa,
-            'academic_performance': academic_performance,
-            'next_available_divisions': next_divisions,
-            'transition_eligibility': self._check_transition_eligibility(student, cumulative_gpa)
-        }
-    
-    def _calculate_academic_year(self, semester):
-        """حساب السنة الأكاديمية من الفصل الدراسي"""
-        return (semester + 1) // 2
-    
-    def _calculate_cumulative_gpa(self, student):
-        """حساب المعدل التراكمي الصحيح - مجموع GPAs ÷ عدد الترمات"""
-        # الطالب في الترم 7 = لديه GPAs لـ 6 ترمات فقط
-        completed_semesters = student.Semester - 1
-        
-        gpas = [student.GPA1, student.GPA2, student.GPA3, student.GPA4,
-                student.GPA5, student.GPA6, student.GPA7, student.GPA8]
-        
-        # أخذ GPAs للترمات المكتملة فقط
-        valid_gpas = []
-        for i in range(min(completed_semesters, len(gpas))):
-            if gpas[i] is not None:
-                valid_gpas.append(gpas[i])
-        
-        if not valid_gpas:
-            return 0.0
-        
-        cumulative_gpa = sum(valid_gpas) / len(valid_gpas)
-        
-        return {
-            'current_cumulative': round(cumulative_gpa, 2),
-            'completed_semesters': len(valid_gpas),
-            'semester_gpas': valid_gpas,
-            'trend': self._calculate_gpa_trend(valid_gpas)
-        }
-    
-    def _calculate_gpa_trend(self, gpas):
-        """حساب اتجاه المعدل التراكمي"""
-        if len(gpas) < 2:
-            return 'غير كافي للتحليل'
-        
-        # مقارنة آخر ترمين مع الترمات السابقة
-        recent_avg = sum(gpas[-2:]) / 2 if len(gpas) >= 2 else gpas[-1]
-        earlier_avg = sum(gpas[:-2]) / len(gpas[:-2]) if len(gpas) > 2 else gpas[0]
-        
-        if recent_avg > earlier_avg + 0.2:
-            return 'متحسن'
-        elif recent_avg < earlier_avg - 0.2:
-            return 'متراجع'
+
+    def _determine_current_stage_biology_geology(self, semester):
+        """تحديد المرحلة الحالية للمسارات البيولوجية والجيولوجية"""
+        if semester <= 4:
+            return 'السنة الأولى والثانية - شعبة عامة (ترم 1-4)'
         else:
-            return 'مستقر'
-    
-    def _get_completed_courses(self, student_id):
-        """الحصول على المقررات المكتملة للطالب"""
-        completed_enrollments = Enrollments.query.filter(
-            and_(
-                Enrollments.StudentId == student_id,
-                Enrollments.IsCompleted == 'ناجح',
-                Enrollments.Grade.isnot(None)
+            return 'السنة الثالثة والرابعة - متخصص (ترم 5-8)'
+
+    def _determine_current_stage_natural_sciences(self, semester):
+        """تحديد المرحلة الحالية لمسار العلوم الطبيعية"""
+        if semester <= 2:
+            return 'السنة الأولى - شعبة عامة'
+        elif semester <= 4:
+            return 'السنة الثانية - تشعيب متوسط'
+        else:
+            return 'السنة الثالثة والرابعة - تخصص نهائي'
+
+    def _create_general_semesters_plan(self, student, current_semester, max_credits):
+        """إنشاء خطة للفصول العامة"""
+        plan = {}
+        
+        # تحديد الفصول المتبقية في المرحلة العامة
+        remaining_semesters = []
+        if current_semester == 1:
+            remaining_semesters = [2, 3, 4]
+        elif current_semester == 2:
+            remaining_semesters = [3, 4]
+        elif current_semester == 3:
+            remaining_semesters = [4]
+        elif current_semester == 4:
+            # إذا كان في الترم 4، نعرض فقط خطة الترم التالي (5) كمتخصص
+            remaining_semesters = [5]
+            
+        for semester in remaining_semesters:
+            if semester <= 4:
+                # فصول عامة
+                semester_courses = self._get_general_courses_for_semester(
+                    student, semester, max_credits
+                )
+                plan[f'semester_{semester}'] = {
+                    'semester_number': semester,
+                    'semester_name': f'الترم {semester} - عام',
+                    'courses': semester_courses,
+                    'total_credits': sum(course['credits'] for course in semester_courses),
+                    'course_ratio': self._calculate_course_ratio(semester_courses)
+                }
+            else:
+                # فصول متخصصة (الترم 5 فما فوق)
+                semester_courses = self._get_specialization_courses(
+                    student, 'متخصص', semester, max_credits
+                )
+                plan[f'semester_{semester}'] = {
+                    'semester_number': semester,
+                    'semester_name': f'الترم {semester} - متخصص',
+                    'courses': semester_courses,
+                    'total_credits': sum(course['credits'] for course in semester_courses),
+                    'note': 'يتطلب اختيار التخصص أولاً'
+                }
+            
+        return plan
+
+    def _create_semester_plan_until(self, student, end_semester, max_credits):
+        """إنشاء خطة من الترم الحالي حتى ترم معين"""
+        plan = {}
+        current_semester = student.Semester
+        
+        for semester in range(current_semester + 1, end_semester + 1):
+            semester_courses = self._get_courses_for_semester(
+                student, semester, max_credits
             )
-        ).all()
+            plan[f'semester_{semester}'] = {
+                'semester_number': semester,
+                'semester_name': f'الترم {semester}',
+                'courses': semester_courses,
+                'total_credits': sum(course['credits'] for course in semester_courses),
+                'course_ratio': self._calculate_course_ratio(semester_courses)
+            }
+            
+        return plan
+
+    def _get_general_courses_for_semester(self, student, semester, max_credits):
+        """الحصول على المقررات العامة لترم معين مع البيانات الكاملة"""
+        from models import Courses
         
-        completed_courses = []
-        for enrollment in completed_enrollments:
-            completed_courses.append({
-                'course_id': enrollment.CourseId,
-                'course_name': enrollment.course.Name,
-                'course_code': enrollment.course.Code,
-                'credits': enrollment.course.Credits,
-                'grade': float(enrollment.Grade) if enrollment.Grade else None,
-                'semester': enrollment.Semester
-            })
+        # الحصول على المقررات المتاحة للشعبة
+        available_courses = self._get_available_courses_for_division(student.DivisionId)
         
-        return completed_courses
-    
-    def _get_next_available_divisions(self, student):
-        """تحديد التشعيبات المتاحة للطالب في المرحلة القادمة"""
-        current_division = student.division.Name
-        current_year = self._calculate_academic_year(student.Semester)
+        # تصفية المقررات حسب الترم ومتطلبات الطالب
+        completed_courses = self._get_completed_course_ids(student.Id)
         
-        # التحقق من إمكانية الانتقال بناءً على السنة الأكاديمية
-        available_division_codes = []
+        # اختيار المقررات بنسبة 3:1 (إجباري:اختياري)
+        mandatory_courses = [c for c in available_courses if c['is_mandatory'] and c['course_id'] not in completed_courses]
+        elective_courses = [c for c in available_courses if not c['is_mandatory'] and c['course_id'] not in completed_courses]
         
-        if current_division in self.transition_map:
-            if (current_division in ['1030'] and current_year >= 2) or \
-               (current_division in ['1035', '1095', '1085', '1090'] and current_year >= 3):
-                available_division_codes = self.transition_map[current_division]
+        selected_courses = []
+        total_credits = 0
         
-        # الحصول على تفاصيل التشعيبات من قاعدة البيانات
-        available_divisions = []
-        for div_code in available_division_codes:
-            division = Divisions.query.filter_by(Name=div_code).first()
-            if division:
-                available_divisions.append({
-                    'id': division.Id,
-                    'code': division.Name,
-                    'name': self._get_division_display_name(division.Name),
-                    'department_id': division.DepartmentId,
-                    'department_name': division.department.Name if division.department else 'غير محدد'
+        # إضافة المقررات الإجبارية أولاً
+        for course_data in mandatory_courses:
+            if total_credits + course_data['credits'] <= max_credits:
+                # الحصول على بيانات المقرر الكاملة من قاعدة البيانات
+                course = Courses.query.get(course_data['course_id'])
+                if course:
+                    selected_courses.append({
+                        'course_id': course.Id,
+                        'course_name': course.Name,
+                        'course_code': course.Code,
+                        'credits': course.Credits
+                    })
+                    total_credits += course.Credits
+                
+        # إضافة بعض المقررات الاختيارية
+        remaining_credits = max_credits - total_credits
+        for course_data in elective_courses:
+            if total_credits + course_data['credits'] <= max_credits and len([c for c in selected_courses if not course_data['is_mandatory']]) < len(selected_courses) // 3:
+                course = Courses.query.get(course_data['course_id'])
+                if course:
+                    selected_courses.append({
+                        'course_id': course.Id,
+                        'course_name': course.Name,
+                        'course_code': course.Code,
+                        'credits': course.Credits
+                    })
+                    total_credits += course.Credits
+                
+        return selected_courses[:6]  # حد أقصى 6 مقررات
+
+    def _get_courses_for_semester(self, student, semester, max_credits):
+        """الحصول على المقررات لترم معين"""
+        return self._get_general_courses_for_semester(student, semester, max_credits)
+
+    def _analyze_student_performance(self, student):
+        """تحليل أداء الطالب مع تحليل شامل للدرجات من جدول Enrollments - محسن للسرعة"""
+        # التحقق من الكاش أولاً
+        cache_key = f"performance_{student.Id}_{student.Semester}"
+        if cache_key in self._performance_cache:
+            return self._performance_cache[cache_key]
+            
+        from models import Enrollments
+        
+        # استعلام محسن واحد بدلاً من عدة استعلامات
+        enrollments = Enrollments.query.filter_by(
+            StudentId=student.Id,
+            IsCompleted='مكتملة'
+        ).join(Enrollments.course).join(Courses.department).all()
+        
+        performance = {
+            'math_performance': [],
+            'physics_performance': [],
+            'chemistry_performance': [],
+            'biology_performance': [],
+            'geology_performance': [],
+            'computer_science_performance': [],
+            'overall_gpa': self._calculate_student_gpa(student),
+            'detailed_grades': [],  # تفاصيل جميع الدرجات
+            'exam_performance': {   # تحليل أداء الامتحانات
+                'exam1_average': 0,
+                'exam2_average': 0,
+                'final_average': 0,
+                'total_courses': 0
+            }
+        }
+        
+        # متغيرات لحساب متوسط الامتحانات
+        exam1_total = 0
+        exam2_total = 0
+        final_total = 0
+        courses_count = 0
+        
+        # تحليل الدرجات حسب أقسام الكورسات - معالجة محسنة
+        for enrollment in enrollments:
+            if enrollment.Grade is not None:
+                course = enrollment.course
+                department_name = course.department.Name.lower()
+                course_name = course.Name.lower()
+                
+                # جمع جميع الدرجات
+                exam1 = float(enrollment.Exam1Grade) if enrollment.Exam1Grade else 0
+                exam2 = float(enrollment.Exam2Grade) if enrollment.Exam2Grade else 0
+                final_grade = float(enrollment.Grade) if enrollment.Grade else 0
+                total_150 = exam1 + exam2 + final_grade
+                
+                # تحويل إلى مقياس 4.0 (من 150 إلى 4.0)
+                grade_4_scale = (total_150 / 150) * 4.0 if total_150 > 0 else 0
+                
+                # حفظ تفاصيل الدرجات
+                performance['detailed_grades'].append({
+                    'course_name': course.Name,
+                    'course_code': course.Code,
+                    'department': course.department.Name,
+                    'semester': enrollment.NumberOFSemster,
+                    'exam1_grade': exam1,
+                    'exam1_percentage': (exam1 / 30) * 100 if exam1 > 0 else 0,
+                    'exam2_grade': exam2,
+                    'exam2_percentage': (exam2 / 30) * 100 if exam2 > 0 else 0,
+                    'final_grade': final_grade,
+                    'final_percentage': (final_grade / 90) * 100 if final_grade > 0 else 0,
+                    'total_150': total_150,
+                    'total_percentage': (total_150 / 150) * 100 if total_150 > 0 else 0,
+                    'gpa_4_scale': round(grade_4_scale, 2)
                 })
+                
+                # حساب متوسطات الامتحانات
+                if exam1 > 0:
+                    exam1_total += exam1
+                if exam2 > 0:
+                    exam2_total += exam2
+                if final_grade > 0:
+                    final_total += final_grade
+                courses_count += 1
+                
+                # تصنيف المواد حسب القسم - استخدام كاش
+                subject_type = self._determine_subject_type_cached(department_name, course_name)
+                
+                if subject_type == 'math':
+                    performance['math_performance'].append(grade_4_scale)
+                elif subject_type == 'physics':
+                    performance['physics_performance'].append(grade_4_scale)
+                elif subject_type == 'chemistry':
+                    performance['chemistry_performance'].append(grade_4_scale)
+                elif subject_type == 'biology':
+                    performance['biology_performance'].append(grade_4_scale)
+                elif subject_type == 'geology':
+                    performance['geology_performance'].append(grade_4_scale)
+                elif subject_type == 'computer_science':
+                    performance['computer_science_performance'].append(grade_4_scale)
         
-        return available_divisions
-    
-    def _get_division_display_name(self, division_code):
-        """الحصول على الاسم المعروض للتشعيب"""
-        display_names = {
-            '1030': 'مجموعة العلوم الطبيعية',
-            '1035': 'الرياضيات والفيزياء',
-            '1095': 'الكيمياء والفيزياء',
-            '1040': 'الرياضيات الخاصة',
-            '1045': 'الفيزياء الخاصة',
-            '1050': 'الرياضيات وعلوم الحاسب',
-            '1055': 'الكيمياء الخاصة',
-            '1085': 'العلوم البيولوجية والكيميائية',
-            '1060': 'علم الحيوان',
-            '1065': 'النبات والكيمياء',
-            '1070': 'علم الحيوان والكيمياء',
-            '1075': 'الكيمياء والكيمياء الحيوية',
-            '1090': 'العلوم الجيولوجية والكيميائية',
-            '1080': 'الجيولوجيا والكيمياء'
-        }
-        
-        return display_names.get(division_code, division_code)
-    
-    def _analyze_academic_performance(self, student):
-        """تحليل الأداء الأكاديمي للطالب"""
-        cumulative_gpa_info = self._calculate_cumulative_gpa(student)
-        current_gpa = cumulative_gpa_info['current_cumulative']
-        
-        # تحديد مستوى الأداء
-        if current_gpa >= 3.5:
-            performance_level = 'ممتاز'
-        elif current_gpa >= 3.0:
-            performance_level = 'جيد جداً'
-        elif current_gpa >= 2.5:
-            performance_level = 'جيد'
-        elif current_gpa >= 2.0:
-            performance_level = 'مقبول'
-        else:
-            performance_level = 'ضعيف'
-        
-        return {
-            'current_cumulative_gpa': current_gpa,
-            'gpa_trend': cumulative_gpa_info['trend'],
-            'performance_level': performance_level,
-            'completed_semesters': cumulative_gpa_info['completed_semesters'],
-            'semester_gpas': cumulative_gpa_info['semester_gpas']
-        }
-    
-    def _check_transition_eligibility(self, student, cumulative_gpa_info):
-        """التحقق من أهلية الطالب للانتقال"""
-        current_gpa = cumulative_gpa_info['current_cumulative']
-        credits_completed = student.CreditsCompleted
-        current_year = self._calculate_academic_year(student.Semester)
-        
-        eligibility = {
-            'is_eligible': True,
-            'requirements_met': [],
-            'requirements_missing': [],
-            'recommendations': []
-        }
-        
-        # متطلبات الانتقال العامة
-        min_gpa_required = 2.0
-        min_credits_per_year = 30
-        
-        if current_gpa >= min_gpa_required:
-            eligibility['requirements_met'].append(f'المعدل التراكمي ({current_gpa:.2f}) يلبي الحد الأدنى')
-        else:
-            eligibility['requirements_missing'].append(f'المعدل التراكمي ({current_gpa:.2f}) أقل من المطلوب ({min_gpa_required})')
-            eligibility['is_eligible'] = False
-        
-        expected_credits = current_year * min_credits_per_year
-        if credits_completed >= expected_credits:
-            eligibility['requirements_met'].append(f'الساعات المكتملة ({credits_completed}) كافية')
-        else:
-            eligibility['requirements_missing'].append(f'نقص في الساعات المكتملة ({credits_completed}/{expected_credits})')
-        
-        # إضافة توصيات
-        if not eligibility['is_eligible']:
-            eligibility['recommendations'].append('ننصح بالتركيز على تحسين المعدل التراكمي قبل الانتقال')
-        
-        if current_gpa >= 3.0:
-            eligibility['recommendations'].append('أداؤك الأكاديمي جيد، يمكنك اختيار التخصص المناسب لميولك')
-        
-        return eligibility
-    
-    def _generate_future_plan(self, student, current_path):
-        """توليد الخطة المستقبلية للطالب"""
-        current_year = self._calculate_academic_year(student.Semester)
-        remaining_years = max(0, 4 - current_year)
-        
-        future_plan = {
-            'remaining_years': remaining_years,
-            'remaining_semesters': max(0, 8 - student.Semester + 1),
-            'expected_graduation_year': datetime.now().year + remaining_years,
-            'next_milestones': self._get_next_milestones(student, current_path),
-            'graduation_requirements': self._get_graduation_requirements(),
-            'recommended_timeline': self._generate_timeline(student, current_path)
-        }
-        
-        return future_plan
-    
-    def _get_next_milestones(self, student, current_path):
-        """الحصول على المعالم القادمة في المسار"""
-        milestones = []
-        current_year = self._calculate_academic_year(student.Semester)
-        
-        if current_path['stage_level'] == 1:  # السنة الأولى
-            milestones.append({
-                'milestone': 'اختيار التخصص الفرعي',
-                'expected_semester': 4,
-                'description': 'اختيار التشعيب للسنة الثانية'
-            })
-        elif current_path['stage_level'] == 2:  # السنة الثانية
-            milestones.append({
-                'milestone': 'اختيار التخصص النهائي',
-                'expected_semester': 6,
-                'description': 'اختيار التشعيب للسنة الثالثة والرابعة'
-            })
-        elif current_path['stage_level'] == 3:  # السنة الثالثة والرابعة
-            milestones.append({
-                'milestone': 'مشروع التخرج',
-                'expected_semester': 8,
-                'description': 'إكمال مشروع التخرج والتخرج'
-            })
-        
-        return milestones
-    
-    def _get_graduation_requirements(self):
-        """متطلبات التخرج العامة"""
-        return {
-            'total_credits': 144,
-            'minimum_gpa': 2.0,
-            'mandatory_courses': 'إكمال جميع المقررات الإجبارية',
-            'elective_courses': 'إكمال العدد المطلوب من المقررات الاختيارية',
-            'final_project': 'مشروع التخرج',
-            'minimum_years': 4
-        }
-    
-    def _generate_timeline(self, student, current_path):
-        """توليد الجدول الزمني للخطة"""
-        current_year = self._calculate_academic_year(student.Semester)
-        timeline = []
-        
-        for year in range(current_year, 5):
-            year_plan = {
-                'academic_year': year,
-                'semesters': [year * 2 - 1, year * 2],
-                'focus_areas': self._get_year_focus_areas(year, current_path),
-                'key_decisions': self._get_year_key_decisions(year, current_path),
-                'expected_credits': 36
-            }
-            timeline.append(year_plan)
-        
-        return timeline
-    
-    def _get_year_focus_areas(self, year, current_path):
-        """مجالات التركيز لكل سنة"""
-        if current_path['path_name'] == 'مسار العلوم الطبيعية':
-            focus_map = {
-                1: ['المقررات الأساسية', 'الرياضيات العامة', 'الفيزياء العامة'],
-                2: ['التخصص الفرعي', 'المقررات المتقدمة'],
-                3: ['التخصص النهائي', 'المقررات التخصصية'],
-                4: ['مشروع التخرج', 'المقررات المتقدمة']
-            }
-        elif current_path['path_name'] == 'مسار العلوم البيولوجية':
-            focus_map = {
-                1: ['العلوم البيولوجية الأساسية', 'الكيمياء العامة'],
-                2: ['العلوم البيولوجية المتقدمة', 'الكيمياء الحيوية'],
-                3: ['التخصص النهائي', 'البحث العلمي'],
-                4: ['مشروع التخرج', 'التطبيقات العملية']
-            }
-        else:  # العلوم الجيولوجية
-            focus_map = {
-                1: ['الجيولوجيا الأساسية', 'الكيمياء العامة'],
-                2: ['الجيولوجيا المتقدمة', 'التدريب الميداني'],
-                3: ['التخصص النهائي', 'الجيولوجيا التطبيقية'],
-                4: ['مشروع التخرج', 'التدريب المهني']
+        # حساب متوسطات الامتحانات
+        if courses_count > 0:
+            performance['exam_performance'] = {
+                'exam1_average': round(exam1_total / courses_count, 2),
+                'exam1_percentage': round((exam1_total / courses_count / 30) * 100, 2),
+                'exam2_average': round(exam2_total / courses_count, 2),
+                'exam2_percentage': round((exam2_total / courses_count / 30) * 100, 2),
+                'final_average': round(final_total / courses_count, 2),
+                'final_percentage': round((final_total / courses_count / 90) * 100, 2),
+                'total_courses': courses_count
             }
         
-        return focus_map.get(year, ['مقررات عامة'])
-    
-    def _get_year_key_decisions(self, year, current_path):
-        """القرارات المهمة لكل سنة"""
-        if current_path['path_name'] == 'مسار العلوم الطبيعية':
-            decisions_map = {
-                2: ['اختيار بين الرياضيات والفيزياء أو الكيمياء والفيزياء'],
-                3: ['اختيار التخصص النهائي من التشعيبات المتاحة'],
-                4: ['اختيار موضوع مشروع التخرج']
-            }
-        elif current_path['path_name'] == 'مسار العلوم البيولوجية':
-            decisions_map = {
-                3: ['اختيار التخصص النهائي في العلوم البيولوجية'],
-                4: ['اختيار مجال البحث لمشروع التخرج']
-            }
-        else:  # العلوم الجيولوجية
-            decisions_map = {
-                3: ['التخصص في الجيولوجيا والكيمياء'],
-                4: ['اختيار مجال التطبيق في مشروع التخرج']
-            }
+        # حساب المتوسطات على مقياس 4.0 لكل مادة
+        for subject in ['math_performance', 'physics_performance', 'chemistry_performance', 
+                       'biology_performance', 'geology_performance', 'computer_science_performance']:
+            if performance[subject]:
+                performance[f'{subject}_avg'] = round(sum(performance[subject]) / len(performance[subject]), 2)
+                performance[f'{subject}_count'] = len(performance[subject])
+            else:
+                performance[f'{subject}_avg'] = 0.0
+                performance[f'{subject}_count'] = 0
         
-        return decisions_map.get(year, [])
-    
-    def _generate_recommendations(self, student):
-        """توصيات للمسار الأكاديمي"""
-        recommendations = []
-        
-        # تحليل الأداء الأكاديمي
-        performance = self._analyze_academic_performance(student)
-        
-        # توصيات بناءً على الأداء
-        if performance['performance_level'] == 'ممتاز':
-            recommendations.append({
-                'type': 'success',
-                'title': 'أداء متميز',
-                'message': 'أداؤك الأكاديمي ممتاز، يمكنك اختيار أي تخصص تفضله',
-                'priority': 'high'
-            })
-        elif performance['performance_level'] == 'ضعيف':
-            recommendations.append({
-                'type': 'warning',
-                'title': 'تحسين الأداء مطلوب',
-                'message': 'ننصح بالتركيز على تحسين المعدل التراكمي قبل اختيار التخصص',
-                'priority': 'high'
-            })
-        
-        # توصيات بناءً على التشعيبات المتاحة
-        next_divisions = self._get_next_available_divisions(student)
-        if next_divisions:
-            recommendations.append({
-                'type': 'info',
-                'title': 'خيارات التخصص',
-                'message': f'لديك {len(next_divisions)} خيارات متاحة للتخصص في المرحلة القادمة',
-                'priority': 'medium'
-            })
-        
-        # توصيات بناءً على الساعات المكتملة
-        if student.CreditsCompleted < 30:
-            recommendations.append({
-                'type': 'warning',
-                'title': 'الساعات المكتملة',
-                'message': 'ننصح بزيادة عدد الساعات المسجلة لتجنب التأخير في التخرج',
-                'priority': 'medium'
-            })
-        
-        return recommendations
+        # حفظ في الكاش
+        self._performance_cache[cache_key] = performance
+        return performance
 
+    @lru_cache(maxsize=500)
+    def _determine_subject_type_cached(self, department_name, course_name):
+        """نسخة محسنة من تحديد نوع المادة مع كاش"""
+        return self._determine_subject_type(department_name, course_name)
 
-class DivisionRecommendationService:
-    """خدمة توصيات التشعيبات"""
-    
-    def __init__(self):
-        self.path_service = AcademicPathService()
-    
-    def get_division_recommendations(self, student_id):
-        """توصيات التشعيب المفصلة للطالب"""
-        student = Students.query.get(student_id)
-        if not student:
-            return None
+    def _determine_subject_type(self, department_name, course_name):
+        """تحديد نوع المادة بناءً على اسم القسم واسم المقرر"""
         
-        # الحصول على التشعيبات المتاحة
-        available_divisions = self.path_service._get_next_available_divisions(student)
-        
-        # تحليل نقاط القوة الأكاديمية
-        academic_strengths = self._analyze_academic_strengths(student)
-        
-        # توليد توصيات مفصلة
-        detailed_recommendations = []
-        for division in available_divisions:
-            recommendation = self._generate_division_recommendation(student, division, academic_strengths)
-            detailed_recommendations.append(recommendation)
-        
-        # ترتيب التوصيات حسب درجة الملاءمة
-        detailed_recommendations.sort(key=lambda x: x['suitability_score'], reverse=True)
-        
-        return {
-            'student_id': student_id,
-            'student_name': student.Name,
-            'current_division': {
-                'id': student.DivisionId,
-                'name': student.division.Name,
-                'display_name': self.path_service._get_division_display_name(student.division.Name)
-            },
-            'academic_strengths': academic_strengths,
-            'recommendations': detailed_recommendations,
-            'generated_at': datetime.now().isoformat()
+        # أولاً: التصنيف حسب أسماء الأقسام (الأولوية الأولى)
+        department_mappings = {
+            'رياضيات': 'math',
+            'mathematics': 'math',
+            'math': 'math',
+            'الرياضيات': 'math',
+            
+            'فيزياء': 'physics', 
+            'physics': 'physics',
+            'الفيزياء': 'physics',
+            
+            'كيمياء': 'chemistry',
+            'chemistry': 'chemistry',
+            'الكيمياء': 'chemistry',
+            'كيمياء حيوية': 'chemistry',
+            'biochemistry': 'chemistry',
+            
+            'أحياء': 'biology',
+            'biology': 'biology',
+            'الأحياء': 'biology',
+            'علم الحيوان': 'biology',
+            'zoology': 'biology',
+            'علم النبات': 'biology', 
+            'botany': 'biology',
+            'نبات': 'biology',
+            'حيوان': 'biology',
+            
+            'جيولوجيا': 'geology',
+            'geology': 'geology',
+            'الجيولوجيا': 'geology',
+            'علوم الأرض': 'geology',
+            'earth sciences': 'geology',
+            
+            'حاسب': 'computer_science',
+            'computer': 'computer_science',
+            'علوم الحاسب': 'computer_science',
+            'computer science': 'computer_science',
+            'حاسوب': 'computer_science'
         }
-    
-    def _analyze_academic_strengths(self, student):
-        """تحليل نقاط القوة الأكاديمية بناءً على الدرجات في المقررات"""
-        enrollments = Enrollments.query.filter(
-            and_(
-                Enrollments.StudentId == student.Id,
-                Enrollments.Grade.isnot(None)
-            )
+        
+        # التحقق من اسم القسم أولاً
+        for dept_keyword, subject_type in department_mappings.items():
+            if dept_keyword in department_name:
+                return subject_type
+        
+        # ثانياً: التصنيف حسب أسماء المقررات (كدعم إضافي)
+        course_mappings = {
+            'math': ['رياض', 'math', 'calculus', 'algebra', 'geometry', 'statistics', 'إحصاء', 'جبر', 'هندسة', 'تفاضل', 'تكامل'],
+            'physics': ['فيزياء', 'physics', 'mechanics', 'thermodynamics', 'optics', 'ميكانيكا', 'بصريات', 'حرارة'],
+            'chemistry': ['كيمياء', 'chemistry', 'organic', 'inorganic', 'analytical', 'عضوية', 'غير عضوية', 'تحليلية'],
+            'biology': ['أحياء', 'biology', 'حيوان', 'نبات', 'zoology', 'botany', 'anatomy', 'physiology', 'تشريح', 'وظائف'],
+            'geology': ['جيولوج', 'geology', 'minerals', 'rocks', 'معادن', 'صخور', 'أرض'],
+            'computer_science': ['حاسب', 'computer', 'programming', 'software', 'algorithm', 'برمجة', 'خوارزميات', 'نظم']
+        }
+        
+        for subject_type, keywords in course_mappings.items():
+            for keyword in keywords:
+                if keyword in course_name:
+                    return subject_type
+        
+        # إذا لم يتم العثور على تصنيف، إرجاع None
+        return None
+        
+    def _get_department_based_courses(self, student):
+        """الحصول على الكورسات مصنفة حسب الأقسام للطالب"""
+        enrollments = Enrollments.query.filter_by(
+            StudentId=student.Id,
+            IsCompleted='مكتملة'
         ).all()
         
-        subject_performance = {}
+        department_courses = {}
         
         for enrollment in enrollments:
-            course = enrollment.course
-            subject_type = self._categorize_course(course.Name)
-            
-            if subject_type not in subject_performance:
-                subject_performance[subject_type] = []
-            
-            subject_performance[subject_type].append(float(enrollment.Grade))
+            if enrollment.Grade is not None:
+                course = enrollment.course
+                department_name = course.department.Name
+                
+                if department_name not in department_courses:
+                    department_courses[department_name] = []
+                
+                department_courses[department_name].append({
+                    'course_name': course.Name,
+                    'course_code': course.Code,
+                    'credits': course.Credits,
+                    'grade': float(enrollment.Grade),
+                    'semester': enrollment.NumberOFSemster
+                })
         
-        # حساب المتوسطات ونقاط القوة
-        strengths = {}
-        for subject_type, grades in subject_performance.items():
-            average = sum(grades) / len(grades)
-            strengths[subject_type] = {
-                'average_grade': round(average, 2),
-                'courses_count': len(grades),
-                'strength_level': self._determine_strength_level(average),
-                'grades': grades
-            }
+        return department_courses
+
+    def _recommend_specialization(self, student, available_specializations, performance):
+        """اقتراح التخصص بناءً على الأداء"""
+        recommendations = []
         
-        return strengths
-    
-    def _categorize_course(self, course_name):
-        """تصنيف المقرر حسب المجال العلمي"""
-        course_name_lower = course_name.lower()
+        for specialization in available_specializations:
+            score = self._calculate_specialization_score(specialization, performance)
+            recommendations.append({
+                'specialization': specialization,
+                'suitability_score': score,
+                'recommendation_level': self._get_recommendation_level(score),
+                'reasoning': self._get_specialization_reasoning(specialization, performance)
+            })
         
-        # قاموس الكلمات المفتاحية لكل مجال
-        categories = {
-            'mathematics': ['رياض', 'math', 'حساب', 'إحصاء', 'جبر', 'هندسة', 'تفاضل', 'تكامل'],
-            'physics': ['فيزياء', 'physics', 'فيزيقا'],
-            'chemistry': ['كيمياء', 'chemistry', 'كيميائي'],
-            'biology': ['أحياء', 'biology', 'حيوان', 'نبات', 'وراثة', 'خلية'],
-            'geology': ['جيولوجيا', 'geology', 'أرض', 'معادن', 'صخور'],
-            'computer_science': ['حاسب', 'computer', 'برمجة', 'خوارزم', 'بيانات']
+        # ترتيب التوصيات حسب النقاط
+        recommendations.sort(key=lambda x: x['suitability_score'], reverse=True)
+        
+        return {
+            'recommended_specialization': recommendations[0],
+            'all_recommendations': recommendations,
+            'performance_summary': self._summarize_performance(performance)
         }
+
+    def _calculate_specialization_score(self, specialization, performance):
+        """حساب نقاط الملاءمة للتخصص بناءً على الأداء الفعلي في الأقسام"""
+        score = 0
+        base_gpa = performance['overall_gpa']
         
-        for category, keywords in categories.items():
-            if any(keyword in course_name_lower for keyword in keywords):
-                return category
-        
-        return 'general'
-    
-    def _determine_strength_level(self, average_grade):
-        """تحديد مستوى القوة بناءً على المتوسط"""
-        if average_grade >= 3.5:
+        if 'حيوان' in specialization:
+            # تخصص علم الحيوان
+            biology_avg = performance['biology_performance_avg']
+            chemistry_avg = performance['chemistry_performance_avg']
+            
+            score += biology_avg * 0.6  # أداء الأحياء أولوية قصوى
+            score += chemistry_avg * 0.3  # الكيمياء مهمة كدعم
+            score += base_gpa * 0.1  # المعدل العام
+            
+        elif 'نبات' in specialization:
+            # تخصص النبات والكيمياء
+            biology_avg = performance['biology_performance_avg']
+            chemistry_avg = performance['chemistry_performance_avg']
+            
+            score += biology_avg * 0.5  # أداء الأحياء
+            score += chemistry_avg * 0.4  # الكيمياء أساسية
+            score += base_gpa * 0.1
+            
+        elif 'كيمياء' in specialization and 'حيوية' in specialization:
+            # تخصص الكيمياء الحيوية
+            chemistry_avg = performance['chemistry_performance_avg']
+            biology_avg = performance['biology_performance_avg']
+            
+            score += chemistry_avg * 0.6  # الكيمياء أساسية
+            score += biology_avg * 0.3   # الأحياء مساندة
+            score += base_gpa * 0.1
+            
+        elif 'كيمياء' in specialization:
+            # تخصص الكيمياء العامة
+            chemistry_avg = performance['chemistry_performance_avg']
+            math_avg = performance['math_performance_avg']
+            physics_avg = performance['physics_performance_avg']
+            
+            score += chemistry_avg * 0.7  # الكيمياء أساسية
+            score += math_avg * 0.15      # الرياضيات مساندة
+            score += physics_avg * 0.05   # الفيزياء مساندة
+            score += base_gpa * 0.1
+            
+        elif 'جيولوج' in specialization:
+            # تخصص الجيولوجيا والكيمياء
+            geology_avg = performance['geology_performance_avg']
+            chemistry_avg = performance['chemistry_performance_avg']
+            physics_avg = performance['physics_performance_avg']
+            
+            score += geology_avg * 0.6    # الجيولوجيا أساسية
+            score += chemistry_avg * 0.2  # الكيمياء مساندة
+            score += physics_avg * 0.1    # الفيزياء مساندة
+            score += base_gpa * 0.1
+            
+        elif 'رياضيات' in specialization and 'حاسب' in specialization:
+            # تخصص الرياضيات وعلوم الحاسب
+            math_avg = performance['math_performance_avg']
+            cs_avg = performance['computer_science_performance_avg']
+            physics_avg = performance['physics_performance_avg']
+            
+            score += math_avg * 0.5       # الرياضيات أساسية
+            score += cs_avg * 0.3         # علوم الحاسب مهمة
+            score += physics_avg * 0.1    # الفيزياء مساندة
+            score += base_gpa * 0.1
+            
+        elif 'رياضيات' in specialization:
+            # تخصص الرياضيات
+            math_avg = performance['math_performance_avg']
+            physics_avg = performance['physics_performance_avg']
+            
+            score += math_avg * 0.7       # الرياضيات أساسية
+            score += physics_avg * 0.2    # الفيزياء مساندة
+            score += base_gpa * 0.1
+            
+        elif 'فيزياء' in specialization:
+            # تخصص الفيزياء
+            physics_avg = performance['physics_performance_avg']
+            math_avg = performance['math_performance_avg']
+            
+            score += physics_avg * 0.7    # الفيزياء أساسية
+            score += math_avg * 0.2       # الرياضيات مساندة
+            score += base_gpa * 0.1
+            
+        else:
+            # تخصص غير معروف - استخدام المعدل العام فقط
+            score = base_gpa
+            
+        return round(score, 2)
+
+    def _get_recommendation_level(self, score):
+        """تحديد مستوى التوصية"""
+        if score >= 3.5:
             return 'ممتاز'
-        elif average_grade >= 3.0:
+        elif score >= 3.0:
             return 'جيد جداً'
-        elif average_grade >= 2.5:
+        elif score >= 2.5:
             return 'جيد'
-        elif average_grade >= 2.0:
+        elif score >= 2.0:
             return 'مقبول'
         else:
             return 'ضعيف'
-    
-    def _generate_division_recommendation(self, student, division, academic_strengths):
-        """توليد توصية مفصلة لتشعيب معين"""
-        suitability_score = self._calculate_suitability_score(student, division, academic_strengths)
-        
-        recommendation = {
-            'division_id': division['id'],
-            'division_code': division['code'],
-            'division_name': division['name'],
-            'department_name': division['department_name'],
-            'suitability_score': suitability_score,
-            'recommendation_level': self._get_recommendation_level(suitability_score),
-            'strengths_alignment': self._analyze_strengths_alignment(division, academic_strengths),
-            'reasons': self._get_recommendation_reasons(student, division, academic_strengths),
-            'requirements': self._get_division_requirements(division['code']),
-            'career_prospects': self._get_career_prospects(division['code']),
-            'courses_info': self._get_division_courses_info(division['id'])
-        }
-        
-        return recommendation
-    
-    def _calculate_suitability_score(self, student, division, academic_strengths):
-        """حساب درجة ملاءمة التشعيب للطالب"""
-        base_score = 50
-        
-        # عامل المعدل التراكمي
-        cumulative_gpa_info = self.path_service._calculate_cumulative_gpa(student)
-        current_gpa = cumulative_gpa_info['current_cumulative']
-        
-        if current_gpa >= 3.5:
-            base_score += 20
-        elif current_gpa >= 3.0:
-            base_score += 15
-        elif current_gpa >= 2.5:
-            base_score += 10
-        elif current_gpa < 2.0:
-            base_score -= 10
-        
-        # عامل نقاط القوة الأكاديمية
-        division_code = division['code']
-        
-        # تحليل بناءً على نوع التشعيب
-        if division_code in ['1040', '1050']:  # تشعيبات الرياضيات
-            if 'mathematics' in academic_strengths:
-                math_level = academic_strengths['mathematics']['strength_level']
-                if math_level == 'ممتاز':
-                    base_score += 25
-                elif math_level == 'جيد جداً':
-                    base_score += 20
-                elif math_level == 'جيد':
-                    base_score += 15
-        
-        elif division_code == '1045':  # الفيزياء الخاصة
-            physics_bonus = 0
-            math_bonus = 0
-            
-            if 'physics' in academic_strengths:
-                physics_level = academic_strengths['physics']['strength_level']
-                if physics_level == 'ممتاز':
-                    physics_bonus = 20
-                elif physics_level == 'جيد جداً':
-                    physics_bonus = 15
-            
-            if 'mathematics' in academic_strengths:
-                math_level = academic_strengths['mathematics']['strength_level']
-                if math_level in ['ممتاز', 'جيد جداً']:
-                    math_bonus = 10
-            
-            base_score += physics_bonus + math_bonus
-        
-        elif division_code in ['1055', '1095']:  # تشعيبات الكيمياء
-            if 'chemistry' in academic_strengths:
-                chem_level = academic_strengths['chemistry']['strength_level']
-                if chem_level == 'ممتاز':
-                    base_score += 25
-                elif chem_level == 'جيد جداً':
-                    base_score += 20
-        
-        elif division_code in ['1060', '1065', '1070', '1075']:  # تشعيبات البيولوجيا
-            if 'biology' in academic_strengths:
-                bio_level = academic_strengths['biology']['strength_level']
-                if bio_level == 'ممتاز':
-                    base_score += 25
-                elif bio_level == 'جيد جداً':
-                    base_score += 20
-        
-        elif division_code == '1080':  # الجيولوجيا
-            if 'geology' in academic_strengths:
-                geo_level = academic_strengths['geology']['strength_level']
-                if geo_level == 'ممتاز':
-                    base_score += 25
-                elif geo_level == 'جيد جداً':
-                    base_score += 20
-        
-        return min(100, max(0, base_score))
-    
-    def _get_recommendation_level(self, score):
-        """تحديد مستوى التوصية بناءً على النقاط"""
-        if score >= 80:
-            return 'موصى به بشدة'
-        elif score >= 65:
-            return 'موصى به'
-        elif score >= 50:
-            return 'مناسب'
-        else:
-            return 'غير موصى به'
-    
-    def _analyze_strengths_alignment(self, division, academic_strengths):
-        """تحليل مدى توافق نقاط القوة مع التشعيب"""
-        division_code = division['code']
-        alignment = []
-        
-        # تحديد المجالات المطلوبة لكل تشعيب
-        required_strengths = {
-            '1040': ['mathematics'],  # الرياضيات الخاصة
-            '1045': ['physics', 'mathematics'],  # الفيزياء الخاصة
-            '1050': ['mathematics', 'computer_science'],  # الرياضيات وعلوم الحاسب
-            '1055': ['chemistry'],  # الكيمياء الخاصة
-            '1095': ['chemistry', 'physics'],  # الكيمياء والفيزياء
-            '1060': ['biology'],  # علم الحيوان
-            '1065': ['biology', 'chemistry'],  # النبات والكيمياء
-            '1070': ['biology', 'chemistry'],  # علم الحيوان والكيمياء
-            '1075': ['chemistry', 'biology'],  # الكيمياء والكيمياء الحيوية
-            '1080': ['geology', 'chemistry']  # الجيولوجيا والكيمياء
-        }
-        
-        required = required_strengths.get(division_code, [])
-        
-        for strength_area in required:
-            if strength_area in academic_strengths:
-                strength_info = academic_strengths[strength_area]
-                alignment.append({
-                    'area': strength_area,
-                    'level': strength_info['strength_level'],
-                    'average_grade': strength_info['average_grade'],
-                    'is_strong': strength_info['strength_level'] in ['ممتاز', 'جيد جداً']
-                })
-            else:
-                alignment.append({
-                    'area': strength_area,
-                    'level': 'غير متوفر',
-                    'average_grade': 0,
-                    'is_strong': False
-                })
-        
-        return alignment
-    
-    def _get_recommendation_reasons(self, student, division, academic_strengths):
-        """أسباب التوصية"""
+
+    def _get_specialization_reasoning(self, specialization, performance):
+        """تفسير سبب التوصية بناءً على الأداء الفعلي في الأقسام"""
         reasons = []
         
-        # تحليل نقاط القوة
-        alignment = self._analyze_strengths_alignment(division, academic_strengths)
+        # الحصول على متوسطات الأداء
+        biology_avg = performance['biology_performance_avg']
+        chemistry_avg = performance['chemistry_performance_avg']
+        math_avg = performance['math_performance_avg']
+        physics_avg = performance['physics_performance_avg']
+        geology_avg = performance['geology_performance_avg']
+        cs_avg = performance['computer_science_performance_avg']
+        overall_gpa = performance['overall_gpa']
         
-        for align in alignment:
-            if align['is_strong']:
-                reasons.append(f"أداء {align['level']} في مجال {self._translate_subject(align['area'])}")
-        
-        # تحليل المعدل التراكمي
-        cumulative_gpa_info = self.path_service._calculate_cumulative_gpa(student)
-        current_gpa = cumulative_gpa_info['current_cumulative']
-        if current_gpa >= 3.0:
-            reasons.append(f"معدل تراكمي جيد ({current_gpa:.2f})")
-        
-        # أسباب خاصة بكل تشعيب
-        division_specific_reasons = self._get_division_specific_reasons(division['code'], student)
-        reasons.extend(division_specific_reasons)
-        
-        return reasons
-    
-    def _translate_subject(self, subject):
-        """ترجمة أسماء المواد"""
-        translations = {
-            'mathematics': 'الرياضيات',
-            'physics': 'الفيزياء',
-            'chemistry': 'الكيمياء',
-            'biology': 'الأحياء',
-            'geology': 'الجيولوجيا',
-            'computer_science': 'علوم الحاسب'
-        }
-        return translations.get(subject, subject)
-    
-    def _get_division_specific_reasons(self, division_code, student):
-        """أسباب خاصة بكل تشعيب"""
-        reasons = []
-        
-        if division_code == '1050':  # الرياضيات وعلوم الحاسب
-            reasons.append("مجال متنامي مع فرص عمل ممتازة في التكنولوجيا")
-        elif division_code == '1045':  # الفيزياء الخاصة
-            reasons.append("أساس قوي للدراسات العليا والبحث العلمي")
-        elif division_code in ['1060', '1065', '1070', '1075']:  # البيولوجيا
-            reasons.append("مجال حيوي مع تطبيقات في الطب والبيئة")
-        
-        return reasons
-    
-    def _get_division_requirements(self, division_code):
-        """متطلبات كل تشعيب"""
-        requirements = {
-            '1040': ['تفوق في الرياضيات', 'معدل تراكمي لا يقل عن 2.5'],
-            '1045': ['تفوق في الفيزياء والرياضيات', 'مهارات تحليلية قوية'],
-            '1050': ['تفوق في الرياضيات', 'مهارات أساسية في الحاسوب'],
-            '1055': ['تفوق في الكيمياء', 'مهارات معملية جيدة'],
-            '1095': ['أداء جيد في الكيمياء والفيزياء'],
-            '1060': ['تفوق في علم الحيوان', 'مهارات بحثية'],
-            '1065': ['أداء جيد في النبات والكيمياء'],
-            '1070': ['تفوق في علم الحيوان والكيمياء'],
-            '1075': ['تفوق في الكيمياء والكيمياء الحيوية'],
-            '1080': ['أداء جيد في الجيولوجيا والكيمياء', 'استعداد للعمل الميداني']
-        }
-        
-        return requirements.get(division_code, ['متطلبات عامة'])
-    
-    def _get_career_prospects(self, division_code):
-        """الفرص المهنية لكل تشعيب"""
-        prospects = {
-            '1040': ['التعليم الجامعي', 'البحث العلمي', 'التحليل الإحصائي', 'الاستشارات المالية'],
-            '1045': ['البحث العلمي', 'الصناعة', 'التكنولوجيا', 'الطاقة'],
-            '1050': ['تطوير البرمجيات', 'تحليل البيانات', 'الذكاء الاصطناعي', 'الأمن السيبراني'],
-            '1055': ['الصناعات الكيميائية', 'البحث والتطوير', 'مراقبة الجودة', 'البيئة'],
-            '1095': ['الصناعة', 'البحث العلمي', 'التحليل الكيميائي'],
-            '1060': ['البحث البيولوجي', 'المحميات الطبيعية', 'التعليم'],
-            '1065': ['الزراعة', 'البيئة', 'البحث النباتي'],
-            '1070': ['البحث البيولوجي', 'المختبرات الطبية', 'البيئة'],
-            '1075': ['الصناعات الدوائية', 'البحث الطبي', 'التحليل الحيوي'],
-            '1080': ['شركات البترول', 'المناجم', 'الاستشارات الجيولوجية', 'البحث البيئي']
-        }
-        
-        return prospects.get(division_code, ['فرص متنوعة'])
-    
-    def _get_division_courses_info(self, division_id):
-        """معلومات المقررات المتاحة في التشعيب"""
-        courses = db.session.query(Courses).join(CourseDivisions).filter(
-            CourseDivisions.DivisionId == division_id
-        ).all()
-        
-        courses_info = {
-            'total_courses': len(courses),
-            'mandatory_courses': len([c for c in courses if any(cd.IsMandatory for cd in c.course_divisions if cd.DivisionId == division_id)]),
-            'total_credits': sum(c.Credits for c in courses),
-            'sample_courses': [
-                {
-                    'name': course.Name,
-                    'code': course.Code,
-                    'credits': course.Credits,
-                    'semester': course.Semester
-                } for course in courses[:5]  # أول 5 مقررات كعينة
-            ]
-        }
-        
-        return courses_info
-
-
-class VerySmartAcademicPathPlanningService:
-    """خدمة التخطيط الأكاديمي الذكي المتقدم - تدمج جميع الخدمات الموجودة"""
-    
-    def __init__(self):
-        # استيراد الخدمات الموجودة لتجنب التكرار
-        try:
-            from services import SmartCourseRecommendationService
-            from services import AcademicStatusAnalysisService
-            from services import AcademicWarningService
-            from services import GraduationEligibilityService
+        if 'حيوان' in specialization:
+            if biology_avg >= 3.5:
+                reasons.append(f'أداء ممتاز في مقررات الأحياء (متوسط: {biology_avg})')
+            elif biology_avg >= 3.0:
+                reasons.append(f'أداء جيد جداً في مقررات الأحياء (متوسط: {biology_avg})')
+            elif biology_avg >= 2.5:
+                reasons.append(f'أداء جيد في مقررات الأحياء (متوسط: {biology_avg})')
             
-            # الخدمات الموجودة
-            self.path_service = AcademicPathService()
-            self.recommendation_service = DivisionRecommendationService()
-            self.course_service = SmartCourseRecommendationService()
-            self.status_service = AcademicStatusAnalysisService()
-            self.warning_service = AcademicWarningService()
-            self.graduation_service = GraduationEligibilityService()
-        except ImportError:
-            # في حالة عدم توفر بعض الخدمات، استخدم الخدمات المتاحة فقط
-            self.path_service = AcademicPathService()
-            self.recommendation_service = DivisionRecommendationService()
-            self.course_service = None
-            self.status_service = None
-            self.warning_service = None
-            self.graduation_service = None
-        
-        # أوزان الذكاء الاصطناعي للتخطيط المتقدم
-        self.ai_weights = {
-            'academic_performance': 0.25,
-            'learning_patterns': 0.20,
-            'career_alignment': 0.15,
-            'risk_mitigation': 0.15,
-            'graduation_optimization': 0.15,
-            'personal_preferences': 0.10
-        }
-    
-    def get_very_smart_academic_plan(self, student_id):
-        """الحصول على الخطة الأكاديمية الذكية المتقدمة"""
-        try:
-            # جمع البيانات من جميع الخدمات الموجودة
-            comprehensive_data = self._gather_comprehensive_data(student_id)
-            
-            if 'error' in comprehensive_data:
-                return comprehensive_data
-            
-            # تطبيق الذكاء الاصطناعي للتحليل المتقدم
-            ai_analysis = self._apply_ai_analysis(comprehensive_data)
-            
-            # توليد الخطة الذكية المخصصة
-            smart_plan = self._generate_smart_plan(comprehensive_data, ai_analysis)
-            
-            # التنبؤ بالمسارات المستقبلية
-            future_predictions = self._predict_future_paths(comprehensive_data, ai_analysis)
-            
-            # توصيات التحسين المستمر
-            optimization_recommendations = self._generate_optimization_recommendations(
-                comprehensive_data, ai_analysis, smart_plan
-            )
-            
-            return {
-                'student_id': student_id,
-                'comprehensive_analysis': comprehensive_data,
-                'ai_insights': ai_analysis,
-                'smart_academic_plan': smart_plan,
-                'future_predictions': future_predictions,
-                'optimization_recommendations': optimization_recommendations,
-                'generated_at': datetime.now().isoformat(),
-                'plan_version': '2.0_ai_enhanced'
-            }
-            
-        except Exception as e:
-            return {
-                'error': f'خطأ في توليد الخطة الذكية: {str(e)}',
-                'student_id': student_id
-            }
-    
-    def _gather_comprehensive_data(self, student_id):
-        """جمع البيانات الشاملة من جميع الخدمات"""
-        try:
-            # البيانات الأساسية للمسار الأكاديمي
-            path_data = self.path_service.get_student_academic_path(student_id)
-            if not path_data:
-                return {'error': 'الطالب غير موجود'}
-            
-            # جمع البيانات من الخدمات المتاحة
-            comprehensive_data = {
-                'basic_path': path_data,
-                'data_quality': self._assess_data_quality(path_data)
-            }
-            
-            # التحليل الأكاديمي الشامل
-            if self.status_service:
-                try:
-                    status_analysis = self.status_service.get_comprehensive_analysis(student_id)
-                    comprehensive_data['comprehensive_status'] = status_analysis
-                except:
-                    comprehensive_data['comprehensive_status'] = None
-            
-            # توصيات المقررات الذكية
-            if self.course_service:
-                try:
-                    course_recommendations = self.course_service.get_smart_recommendations(student_id)
-                    comprehensive_data['course_recommendations'] = course_recommendations
-                except:
-                    comprehensive_data['course_recommendations'] = None
-            
-            # توصيات التشعيبات
-            division_recommendations = self.recommendation_service.get_division_recommendations(student_id)
-            comprehensive_data['division_recommendations'] = division_recommendations
-            
-            # أهلية التخرج
-            if self.graduation_service:
-                try:
-                    graduation_eligibility = self.graduation_service.get_graduation_eligibility(student_id)
-                    comprehensive_data['graduation_status'] = graduation_eligibility
-                except:
-                    comprehensive_data['graduation_status'] = None
-            
-            # الإنذارات الأكاديمية
-            if self.warning_service:
-                try:
-                    academic_warnings = self.warning_service.get_student_warnings(student_id)
-                    comprehensive_data['academic_warnings'] = academic_warnings
-                except:
-                    comprehensive_data['academic_warnings'] = []
-            
-            return comprehensive_data
-            
-        except Exception as e:
-            return {'error': f'خطأ في جمع البيانات: {str(e)}'}
-    
-    def _assess_data_quality(self, path_data):
-        """تقييم جودة البيانات المتاحة"""
-        quality_score = 100
-        issues = []
-        
-        # فحص اكتمال البيانات الأساسية
-        if not path_data.get('student_info', {}).get('current_semester'):
-            quality_score -= 20
-            issues.append('بيانات الفصل الدراسي ناقصة')
-        
-        if not path_data.get('progress', {}).get('cumulative_gpa'):
-            quality_score -= 15
-            issues.append('بيانات المعدل التراكمي ناقصة')
-        
-        # فحص بيانات المقررات
-        completed_courses = path_data.get('progress', {}).get('completed_courses_count', 0)
-        if completed_courses == 0:
-            quality_score -= 25
-            issues.append('لا توجد مقررات مكتملة مسجلة')
-        
-        return {
-            'score': max(0, quality_score),
-            'level': 'ممتاز' if quality_score >= 90 else 'جيد' if quality_score >= 70 else 'مقبول' if quality_score >= 50 else 'ضعيف',
-            'issues': issues,
-            'recommendations': self._get_data_improvement_recommendations(issues)
-        }
-    
-    def _get_data_improvement_recommendations(self, issues):
-        """توصيات لتحسين جودة البيانات"""
-        recommendations = []
-        
-        if 'بيانات الفصل الدراسي ناقصة' in issues:
-            recommendations.append('تحديث بيانات الفصل الدراسي الحالي')
-        
-        if 'بيانات المعدل التراكمي ناقصة' in issues:
-            recommendations.append('إدخال درجات الفصول الدراسية المكتملة')
-        
-        if 'لا توجد مقررات مكتملة مسجلة' in issues:
-            recommendations.append('تسجيل المقررات المكتملة والدرجات المحققة')
-        
-        return recommendations
-    
-    def _apply_ai_analysis(self, comprehensive_data):
-        """تطبيق تحليل الذكاء الاصطناعي المتقدم"""
-        try:
-            # تحليل أنماط التعلم
-            learning_patterns = self._analyze_learning_patterns(comprehensive_data)
-            
-            # تحليل المخاطر الأكاديمية
-            risk_analysis = self._analyze_academic_risks(comprehensive_data)
-            
-            # تحليل التوافق المهني
-            career_alignment = self._analyze_career_alignment(comprehensive_data)
-            
-            # تحليل الكفاءة الأكاديمية
-            efficiency_analysis = self._analyze_academic_efficiency(comprehensive_data)
-            
-            # التنبؤ بالأداء المستقبلي
-            performance_prediction = self._predict_future_performance(comprehensive_data)
-            
-            # تحليل الفرص والتحديات
-            opportunities_threats = self._analyze_opportunities_threats(comprehensive_data)
-            
-            return {
-                'learning_patterns': learning_patterns,
-                'risk_analysis': risk_analysis,
-                'career_alignment': career_alignment,
-                'efficiency_analysis': efficiency_analysis,
-                'performance_prediction': performance_prediction,
-                'opportunities_threats': opportunities_threats,
-                'overall_ai_score': self._calculate_overall_ai_score(
-                    learning_patterns, risk_analysis, career_alignment, 
-                    efficiency_analysis, performance_prediction
-                )
-            }
-            
-        except Exception as e:
-            return {'error': f'خطأ في التحليل الذكي: {str(e)}'}
-    
-    def _analyze_learning_patterns(self, data):
-        """تحليل أنماط التعلم والأداء"""
-        try:
-            status_data = data.get('comprehensive_status', {})
-            path_data = data.get('basic_path', {})
-            
-            # تحليل اتجاه المعدل التراكمي
-            gpa_analysis = path_data.get('progress', {}).get('cumulative_gpa', {})
-            gpa_trend = gpa_analysis.get('trend', 'مستقر')
-            
-            # تحليل الأداء الأكاديمي
-            academic_performance = path_data.get('progress', {}).get('academic_performance', {})
-            
-            # تحديد نمط التعلم المفضل
-            preferred_learning_style = self._determine_learning_style(academic_performance)
-            
-            # تحليل نقاط القوة والضعف
-            strengths_weaknesses = self._analyze_academic_strengths_weaknesses(
-                data.get('course_recommendations', {}),
-                academic_performance
-            )
-            
-            return {
-                'gpa_trend': gpa_trend,
-                'learning_style': preferred_learning_style,
-                'strengths': strengths_weaknesses.get('strengths', []),
-                'weaknesses': strengths_weaknesses.get('weaknesses', []),
-                'optimal_study_load': self._calculate_optimal_study_load(academic_performance),
-                'best_performance_periods': self._identify_best_performance_periods(academic_performance),
-                'learning_efficiency': self._calculate_learning_efficiency(academic_performance)
-            }
-            
-        except Exception as e:
-            return {'error': f'خطأ في تحليل أنماط التعلم: {str(e)}'}
-    
-    def _determine_learning_style(self, performance_data):
-        """تحديد نمط التعلم المفضل"""
-        if not performance_data:
-            return 'غير محدد'
-        
-        gpa_trend = performance_data.get('gpa_trend', 'مستقر')
-        performance_level = performance_data.get('performance_level', 'متوسط')
-        
-        if gpa_trend == 'متحسن':
-            return 'تعلم تدريجي - يحتاج وقت للتكيف'
-        elif gpa_trend == 'متراجع':
-            return 'يحتاج دعم إضافي ومتابعة'
-        elif performance_level == 'ممتاز':
-            return 'متعلم متميز ومستقل'
-        else:
-            return 'متعلم متوازن'
-    
-    def _analyze_academic_strengths_weaknesses(self, course_recommendations, performance_data):
-        """تحليل نقاط القوة والضعف الأكاديمية"""
-        strengths = []
-        weaknesses = []
-        
-        # تحليل من بيانات الأداء
-        if performance_data:
-            performance_level = performance_data.get('performance_level', '')
-            if performance_level == 'ممتاز':
-                strengths.append('أداء أكاديمي متميز')
-            elif performance_level == 'جيد جداً':
-                strengths.append('أداء أكاديمي جيد')
-            elif performance_level in ['ضعيف', 'مقبول']:
-                weaknesses.append('يحتاج تحسين في الأداء العام')
-            
-            gpa_trend = performance_data.get('gpa_trend', '')
-            if gpa_trend == 'متحسن':
-                strengths.append('قدرة على التطوير والتحسن')
-            elif gpa_trend == 'متراجع':
-                weaknesses.append('تراجع في الأداء يحتاج معالجة')
-        
-        return {
-            'strengths': strengths if strengths else ['يحتاج تقييم أعمق'],
-            'weaknesses': weaknesses if weaknesses else ['لا توجد نقاط ضعف واضحة']
-        }
-    
-    def _calculate_optimal_study_load(self, performance_data):
-        """حساب الحمل الدراسي الأمثل"""
-        if not performance_data:
-            return {'recommended_credits': 15, 'reasoning': 'الحمل الدراسي المعياري'}
-        
-        performance_level = performance_data.get('performance_level', 'متوسط')
-        
-        if performance_level == 'ممتاز':
-            return {'recommended_credits': 18, 'reasoning': 'أداء ممتاز يسمح بحمل دراسي أعلى'}
-        elif performance_level == 'جيد جداً':
-            return {'recommended_credits': 16, 'reasoning': 'أداء جيد يسمح بحمل دراسي معتدل'}
-        elif performance_level in ['ضعيف', 'مقبول']:
-            return {'recommended_credits': 12, 'reasoning': 'حمل دراسي مخفف للتركيز على التحسن'}
-        else:
-            return {'recommended_credits': 15, 'reasoning': 'الحمل الدراسي المعياري'}
-    
-    def _identify_best_performance_periods(self, performance_data):
-        """تحديد فترات الأداء الأفضل"""
-        if not performance_data:
-            return 'غير محدد'
-        
-        semester_gpas = performance_data.get('semester_gpas', [])
-        if semester_gpas:
-            best_gpa = max(semester_gpas)
-            best_semester_index = semester_gpas.index(best_gpa) + 1
-            return f'أفضل أداء في الفصل {best_semester_index} بمعدل {best_gpa:.2f}'
-        
-        return 'غير محدد'
-    
-    def _calculate_learning_efficiency(self, performance_data):
-        """حساب كفاءة التعلم"""
-        if not performance_data:
-            return 60.0
-        
-        current_gpa = performance_data.get('current_cumulative_gpa', 0)
-        
-        if current_gpa >= 3.5:
-            return 85.0
-        elif current_gpa >= 3.0:
-            return 75.0
-        elif current_gpa >= 2.5:
-            return 65.0
-        else:
-            return 50.0
-    
-    def _analyze_academic_risks(self, data):
-        """تحليل المخاطر الأكاديمية"""
-        try:
-            path_data = data.get('basic_path', {})
-            progress = path_data.get('progress', {})
-            
-            risks = []
-            risk_level = 'منخفض'
-            
-            # تحليل المعدل التراكمي
-            cumulative_gpa = progress.get('cumulative_gpa', {})
-            current_gpa = cumulative_gpa.get('current_cumulative', 0)
-            
-            if current_gpa < 2.0:
-                risks.append('المعدل التراكمي أقل من الحد الأدنى')
-                risk_level = 'عالي جداً'
-            elif current_gpa < 2.5:
-                risks.append('المعدل التراكمي منخفض')
-                risk_level = 'عالي'
-            elif current_gpa < 3.0:
-                risks.append('المعدل التراكمي يحتاج تحسين')
-                risk_level = 'متوسط'
-            
-            # تحليل اتجاه الأداء
-            gpa_trend = cumulative_gpa.get('trend', 'مستقر')
-            if gpa_trend == 'متراجع':
-                risks.append('اتجاه الأداء متراجع')
-                if risk_level == 'منخفض':
-                    risk_level = 'متوسط'
-            
-            # تحليل الإنذارات الأكاديمية
-            warnings_data = data.get('academic_warnings', [])
-            if warnings_data and len(warnings_data) > 0:
-                # تحويل كائنات الإنذارات إلى قاموس لتجنب مشكلة JSON
-                active_warnings = []
-                for warning in warnings_data:
-                    if hasattr(warning, '__dict__'):
-                        warning_dict = {
-                            'id': getattr(warning, 'Id', None),
-                            'type': getattr(warning, 'WarningType', ''),
-                            'level': getattr(warning, 'WarningLevel', 0),
-                            'status': getattr(warning, 'Status', '')
-                        }
-                        if warning_dict['status'] == 'نشط':
-                            active_warnings.append(warning_dict)
-                    elif isinstance(warning, dict):
-                        if warning.get('status') == 'نشط':
-                            active_warnings.append(warning)
+            if chemistry_avg >= 3.0:
+                reasons.append(f'أداء قوي في الكيمياء يدعم التخصص (متوسط: {chemistry_avg})')
+            elif chemistry_avg >= 2.5:
+                reasons.append(f'أداء مقبول في الكيمياء (متوسط: {chemistry_avg})')
                 
-                if active_warnings:
-                    risks.append(f'يوجد {len(active_warnings)} إنذار أكاديمي نشط')
-                    risk_level = 'عالي'
+        elif 'نبات' in specialization:
+            if biology_avg >= 3.0:
+                reasons.append(f'أداء ممتاز في علوم النبات والأحياء (متوسط: {biology_avg})')
             
+            if chemistry_avg >= 3.0:
+                reasons.append(f'أداء قوي في الكيمياء المطلوبة للتخصص (متوسط: {chemistry_avg})')
+            
+        elif 'كيمياء' in specialization:
+            if chemistry_avg >= 3.5:
+                reasons.append(f'أداء ممتاز في مقررات الكيمياء (متوسط: {chemistry_avg})')
+            elif chemistry_avg >= 3.0:
+                reasons.append(f'أداء جيد جداً في مقررات الكيمياء (متوسط: {chemistry_avg})')
+            elif chemistry_avg >= 2.5:
+                reasons.append(f'أداء جيد في مقررات الكيمياء (متوسط: {chemistry_avg})')
+            
+            if 'حيوية' in specialization and biology_avg >= 2.5:
+                reasons.append(f'أداء جيد في الأحياء يدعم الكيمياء الحيوية (متوسط: {biology_avg})')
+            
+            if math_avg >= 3.0:
+                reasons.append(f'أداء قوي في الرياضيات يدعم الكيمياء (متوسط: {math_avg})')
+                
+        elif 'جيولوج' in specialization:
+            if geology_avg >= 3.0:
+                reasons.append(f'أداء ممتاز في مقررات الجيولوجيا (متوسط: {geology_avg})')
+            elif geology_avg > 0:
+                reasons.append(f'أداء في مقررات الجيولوجيا (متوسط: {geology_avg})')
+            
+            if chemistry_avg >= 2.5:
+                reasons.append(f'أداء جيد في الكيمياء المساندة (متوسط: {chemistry_avg})')
+                
+        elif 'رياضيات' in specialization:
+            if math_avg >= 3.5:
+                reasons.append(f'أداء ممتاز في مقررات الرياضيات (متوسط: {math_avg})')
+            elif math_avg >= 3.0:
+                reasons.append(f'أداء جيد جداً في مقررات الرياضيات (متوسط: {math_avg})')
+            elif math_avg >= 2.5:
+                reasons.append(f'أداء جيد في مقررات الرياضيات (متوسط: {math_avg})')
+            
+            if 'حاسب' in specialization:
+                if cs_avg >= 3.0:
+                    reasons.append(f'أداء قوي في علوم الحاسب (متوسط: {cs_avg})')
+                elif cs_avg > 0:
+                    reasons.append(f'خبرة في علوم الحاسب (متوسط: {cs_avg})')
+                else:
+                    reasons.append('إمكانية جيدة للتطور في علوم الحاسب')
+            
+            if physics_avg >= 2.5:
+                reasons.append(f'أداء جيد في الفيزياء يدعم الرياضيات (متوسط: {physics_avg})')
+                
+        elif 'فيزياء' in specialization:
+            if physics_avg >= 3.5:
+                reasons.append(f'أداء ممتاز في مقررات الفيزياء (متوسط: {physics_avg})')
+            elif physics_avg >= 3.0:
+                reasons.append(f'أداء جيد جداً في مقررات الفيزياء (متوسط: {physics_avg})')
+            elif physics_avg >= 2.5:
+                reasons.append(f'أداء جيد في مقررات الفيزياء (متوسط: {physics_avg})')
+            
+            if math_avg >= 3.0:
+                reasons.append(f'أداء قوي في الرياضيات يدعم الفيزياء (متوسط: {math_avg})')
+        
+        # إضافة معلومة عن المعدل العام إذا كان جيد
+        if overall_gpa >= 3.5:
+            reasons.append(f'معدل تراكمي ممتاز ({overall_gpa})')
+        elif overall_gpa >= 3.0:
+            reasons.append(f'معدل تراكمي جيد جداً ({overall_gpa})')
+        elif overall_gpa >= 2.5:
+            reasons.append(f'معدل تراكمي جيد ({overall_gpa})')
+        
+        # إذا لم توجد أسباب واضحة
+        if not reasons:
+            reasons.append(f'بناءً على المعدل التراكمي العام ({overall_gpa})')
+            if overall_gpa < 2.0:
+                reasons.append('يُنصح بالتركيز على تحسين الأداء العام أولاً')
+            
+        return reasons
+
+    def _summarize_performance(self, performance):
+        """ملخص الأداء المحسن"""
+        return {
+            'overall_gpa': performance['overall_gpa'],
+            'strongest_subject': self._get_strongest_subject(performance),
+            'weakest_subject': self._get_weakest_subject(performance),
+            'performance_trend': self._analyze_performance_trend(performance),
+            'subjects_performance': self._get_detailed_subjects_performance(performance),
+            'recommendations': self._get_performance_recommendations(performance)
+        }
+
+    def _get_strongest_subject(self, performance):
+        """أقوى مادة للطالب"""
+        subjects = {
+            'الرياضيات': performance['math_performance_avg'],
+            'الفيزياء': performance['physics_performance_avg'],
+            'الكيمياء': performance['chemistry_performance_avg'],
+            'الأحياء': performance['biology_performance_avg'],
+            'الجيولوجيا': performance['geology_performance_avg'],
+            'علوم الحاسب': performance['computer_science_performance_avg']
+        }
+        
+        # تصفية المواد التي لها درجات
+        subjects_with_grades = {k: v for k, v in subjects.items() if v > 0}
+        
+        if subjects_with_grades:
+            strongest = max(subjects_with_grades, key=subjects_with_grades.get)
+            strongest_avg = subjects_with_grades[strongest]
             return {
-                'level': risk_level,
-                'factors': risks,
-                'mitigation_strategies': self._generate_risk_mitigation_strategies(risks, risk_level)
+                'subject': strongest,
+                'average': strongest_avg,
+                'performance_level': self._get_performance_level(strongest_avg)
             }
-            
-        except Exception as e:
+        else:
             return {
-                'level': 'غير محدد',
-                'factors': [],
-                'mitigation_strategies': [],
-                'error': f'خطأ في تحليل المخاطر: {str(e)}'
+                'subject': 'غير محدد',
+                'average': 0.0,
+                'performance_level': 'لا توجد بيانات'
             }
-    
-    def _generate_risk_mitigation_strategies(self, risks, risk_level):
-        """توليد استراتيجيات تخفيف المخاطر"""
-        strategies = []
+
+    def _get_weakest_subject(self, performance):
+        """أضعف مادة للطالب"""
+        subjects = {
+            'الرياضيات': performance['math_performance_avg'],
+            'الفيزياء': performance['physics_performance_avg'],
+            'الكيمياء': performance['chemistry_performance_avg'],
+            'الأحياء': performance['biology_performance_avg'],
+            'الجيولوجيا': performance['geology_performance_avg'],
+            'علوم الحاسب': performance['computer_science_performance_avg']
+        }
         
-        if 'المعدل التراكمي' in str(risks):
-            strategies.extend([
-                'وضع خطة دراسية مكثفة',
-                'طلب المساعدة من المرشد الأكاديمي',
-                'التركيز على المواد الأساسية'
-            ])
+        # تصفية المواد التي لها درجات
+        subjects_with_grades = {k: v for k, v in subjects.items() if v > 0}
         
-        if 'إنذار أكاديمي' in str(risks):
-            strategies.extend([
-                'مراجعة عاجلة مع المرشد الأكاديمي',
-                'تقليل عدد الساعات المسجلة',
-                'الاستفادة من برامج الدعم الأكاديمي'
-            ])
-        
-        if 'اتجاه متراجع' in str(risks):
-            strategies.extend([
-                'تحليل أسباب التراجع',
-                'تغيير استراتيجيات الدراسة',
-                'طلب المساعدة النفسية إذا لزم الأمر'
-            ])
-        
-        return strategies if strategies else ['المتابعة المستمرة للأداء الأكاديمي']
-    
-    def _predict_future_paths(self, comprehensive_data, ai_analysis):
-        """التنبؤ بالمسارات المستقبلية"""
-        try:
-            predictions = {
-                'academic_trajectory': self._predict_academic_trajectory(comprehensive_data, ai_analysis),
-                'career_pathways': self._predict_career_pathways(comprehensive_data, ai_analysis),
-                'skill_development': self._predict_skill_development(comprehensive_data, ai_analysis),
-                'challenges_opportunities': self._predict_challenges_opportunities(comprehensive_data, ai_analysis)
+        if subjects_with_grades:
+            weakest = min(subjects_with_grades, key=subjects_with_grades.get)
+            weakest_avg = subjects_with_grades[weakest]
+            return {
+                'subject': weakest,
+                'average': weakest_avg,
+                'performance_level': self._get_performance_level(weakest_avg)
             }
-            
-            return predictions
-            
-        except Exception as e:
-            return {'error': f'خطأ في التنبؤ بالمسارات المستقبلية: {str(e)}'}
-    
-    def _predict_academic_trajectory(self, data, ai_analysis):
-        """التنبؤ بالمسار الأكاديمي"""
-        performance_prediction = ai_analysis.get('performance_prediction', {})
-        
-        return {
-            'expected_gpa_trend': performance_prediction.get('trend_prediction', 'استقرار متوقع'),
-            'graduation_timeline': performance_prediction.get('graduation_prediction', 'غير محدد'),
-            'academic_milestones': [
-                'إكمال متطلبات التشعيب',
-                'تحقيق المعدل المطلوب للتخرج',
-                'إنجاز مشروع التخرج'
-            ]
-        }
-    
-    def _predict_career_pathways(self, data, ai_analysis):
-        """التنبؤ بالمسارات المهنية"""
-        career_alignment = ai_analysis.get('career_alignment', {})
-        
-        return {
-            'primary_career_path': career_alignment.get('current_path_prospects', {}).get('fields', ['غير محدد'])[0] if career_alignment.get('current_path_prospects', {}).get('fields') else 'غير محدد',
-            'alternative_paths': career_alignment.get('current_path_prospects', {}).get('fields', [])[:3],
-            'market_outlook': career_alignment.get('market_trends', 'اتجاهات متوازنة'),
-            'skill_requirements': career_alignment.get('skill_gaps', [])
-        }
-    
-    def _predict_skill_development(self, data, ai_analysis):
-        """التنبؤ بتطوير المهارات"""
-        career_alignment = ai_analysis.get('career_alignment', {})
-        
-        return {
-            'technical_skills': career_alignment.get('skill_gaps', [])[:3],
-            'soft_skills': ['التواصل الفعال', 'العمل الجماعي', 'حل المشكلات'],
-            'development_timeline': 'تطوير تدريجي خلال السنوات المتبقية',
-            'learning_resources': ['دورات تدريبية', 'مشاريع عملية', 'تدريب صيفي']
-        }
-    
-    def _predict_challenges_opportunities(self, data, ai_analysis):
-        """التنبؤ بالتحديات والفرص"""
-        opportunities_threats = ai_analysis.get('opportunities_threats', {})
-        
-        return {
-            'upcoming_challenges': opportunities_threats.get('threats', []),
-            'potential_opportunities': opportunities_threats.get('opportunities', []),
-            'preparation_strategies': [
-                'التخطيط المسبق للتحديات',
-                'بناء شبكة علاقات مهنية',
-                'التطوير المستمر للمهارات'
-            ]
-        }
-    
-    def _generate_optimization_recommendations(self, comprehensive_data, ai_analysis, smart_plan):
-        """توليد توصيات التحسين المستمر"""
-        try:
-            recommendations = {
-                'performance_optimization': self._generate_performance_optimization(ai_analysis),
-                'study_strategy_optimization': self._generate_study_strategy_optimization(ai_analysis),
-                'career_preparation_optimization': self._generate_career_preparation_optimization(ai_analysis),
-                'risk_management_optimization': self._generate_risk_management_optimization(ai_analysis),
-                'continuous_improvement': self._generate_continuous_improvement_plan(ai_analysis)
+        else:
+            return {
+                'subject': 'غير محدد',
+                'average': 0.0,
+                'performance_level': 'لا توجد بيانات'
             }
-            
-            return recommendations
-            
-        except Exception as e:
-            return {'error': f'خطأ في توليد توصيات التحسين: {str(e)}'}
-    
-    def _generate_performance_optimization(self, ai_analysis):
-        """توصيات تحسين الأداء"""
-        learning_patterns = ai_analysis.get('learning_patterns', {})
-        efficiency_analysis = ai_analysis.get('efficiency_analysis', {})
+
+    def _get_performance_level(self, average):
+        """تحديد مستوى الأداء"""
+        if average >= 3.5:
+            return 'ممتاز'
+        elif average >= 3.0:
+            return 'جيد جداً'
+        elif average >= 2.5:
+            return 'جيد'
+        elif average >= 2.0:
+            return 'مقبول'
+        elif average > 0:
+            return 'ضعيف'
+        else:
+            return 'لا توجد بيانات'
+
+    def _get_detailed_subjects_performance(self, performance):
+        """تفاصيل أداء جميع المواد"""
+        subjects_details = {}
         
+        subjects = {
+            'الرياضيات': performance['math_performance_avg'],
+            'الفيزياء': performance['physics_performance_avg'],
+            'الكيمياء': performance['chemistry_performance_avg'],
+            'الأحياء': performance['biology_performance_avg'],
+            'الجيولوجيا': performance['geology_performance_avg'],
+            'علوم الحاسب': performance['computer_science_performance_avg']
+        }
+        
+        for subject, avg in subjects.items():
+            if avg > 0:
+                subjects_details[subject] = {
+                    'average': avg,
+                    'performance_level': self._get_performance_level(avg),
+                    'courses_count': len(performance[f'{self._get_subject_key(subject)}_performance'])
+                }
+            
+        return subjects_details
+
+    def _get_subject_key(self, subject_name):
+        """الحصول على مفتاح المادة في قاموس الأداء"""
+        mapping = {
+            'الرياضيات': 'math',
+            'الفيزياء': 'physics',
+            'الكيمياء': 'chemistry',
+            'الأحياء': 'biology',
+            'الجيولوجيا': 'geology',
+            'علوم الحاسب': 'computer_science'
+        }
+        return mapping.get(subject_name, 'unknown')
+
+    def _get_performance_recommendations(self, performance):
+        """توصيات لتحسين الأداء"""
         recommendations = []
+        overall_gpa = performance['overall_gpa']
         
-        # بناءً على أنماط التعلم
-        learning_style = learning_patterns.get('learning_style', '')
-        if 'يحتاج دعم' in learning_style:
-            recommendations.append('طلب المساعدة الأكاديمية من الأساتذة')
-            recommendations.append('الانضمام لمجموعات الدراسة')
+        if overall_gpa < 2.0:
+            recommendations.append('ضرورة التركيز على رفع المعدل التراكمي فوق 2.0 لتجنب الإنذار الأكاديمي')
+            recommendations.append('طلب المساعدة الأكاديمية من الأساتذة والمرشدين')
+        elif overall_gpa < 2.5:
+            recommendations.append('العمل على تحسين المعدل التراكمي للحصول على فرص أفضل')
         
-        # بناءً على الكفاءة
-        efficiency_level = efficiency_analysis.get('efficiency_level', '')
-        if efficiency_level in ['مقبول', 'يحتاج تحسين']:
-            recommendations.append('تحسين تقنيات الدراسة والمراجعة')
-            recommendations.append('وضع جدول زمني منتظم للدراسة')
+        # فحص أداء المواد الفردية
+        weakest = self._get_weakest_subject(performance)
+        if weakest['average'] > 0 and weakest['average'] < 2.5:
+            recommendations.append(f'التركيز على تحسين الأداء في مادة {weakest["subject"]} (متوسط حالي: {weakest["average"]})')
         
-        return recommendations if recommendations else ['الحفاظ على الأداء الحالي الجيد']
-    
-    def _generate_study_strategy_optimization(self, ai_analysis):
-        """توصيات تحسين استراتيجية الدراسة"""
-        learning_patterns = ai_analysis.get('learning_patterns', {})
-        
-        optimal_load = learning_patterns.get('optimal_study_load', {})
-        recommended_credits = optimal_load.get('recommended_credits', 15)
-        
-        return [
-            f'تسجيل {recommended_credits} ساعة معتمدة كحد أمثل',
-            'توزيع المقررات بتوازن بين الصعبة والسهلة',
-            'التركيز على المقررات الأساسية أولاً',
-            'استغلال فترات الأداء الأفضل للمقررات الصعبة'
-        ]
-    
-    def _generate_career_preparation_optimization(self, ai_analysis):
-        """توصيات تحسين التحضير المهني"""
-        career_alignment = ai_analysis.get('career_alignment', {})
-        career_development = career_alignment.get('career_development', [])
-        
-        recommendations = career_development.copy()
-        
-        # إضافة توصيات عامة
-        recommendations.extend([
-            'بناء محفظة أعمال قوية',
-            'التدريب في الشركات ذات الصلة',
-            'حضور المؤتمرات والفعاليات المهنية'
-        ])
-        
-        return recommendations[:5]  # أول 5 توصيات
-    
-    def _generate_risk_management_optimization(self, ai_analysis):
-        """توصيات تحسين إدارة المخاطر"""
-        risk_analysis = ai_analysis.get('risk_analysis', {})
-        mitigation_strategies = risk_analysis.get('mitigation_strategies', [])
-        
-        recommendations = mitigation_strategies.copy()
-        
-        # إضافة استراتيجيات وقائية
-        recommendations.extend([
-            'المراجعة الدورية للأداء الأكاديمي',
-            'التواصل المستمر مع المرشد الأكاديمي',
-            'وضع خطط بديلة للطوارئ'
-        ])
+        # اقتراحات للتخصص
+        strongest = self._get_strongest_subject(performance)
+        if strongest['average'] >= 3.0:
+            recommendations.append(f'الاستفادة من القوة في مادة {strongest["subject"]} لاختيار التخصص المناسب')
         
         return recommendations
-    
-    def _generate_continuous_improvement_plan(self, ai_analysis):
-        """خطة التحسين المستمر"""
-        overall_score = ai_analysis.get('overall_ai_score', {})
-        current_level = overall_score.get('level', 'متوسط')
-        
-        improvement_plan = {
-            'current_level': current_level,
-            'target_level': self._get_target_level(current_level),
-            'improvement_actions': self._get_improvement_actions(current_level),
-            'monitoring_frequency': 'شهرياً',
-            'review_schedule': 'نهاية كل فصل دراسي'
-        }
-        
-        return improvement_plan
-    
-    def _get_target_level(self, current_level):
-        """تحديد المستوى المستهدف"""
-        level_progression = {
-            'يحتاج تحسين': 'مقبول',
-            'مقبول': 'جيد',
-            'جيد': 'جيد جداً',
-            'جيد جداً': 'ممتاز',
-            'ممتاز': 'ممتاز (الحفاظ على التميز)'
-        }
-        
-        return level_progression.get(current_level, 'جيد')
-    
-    def _get_improvement_actions(self, current_level):
-        """إجراءات التحسين حسب المستوى"""
-        actions_map = {
-            'يحتاج تحسين': [
-                'وضع خطة دراسية مكثفة',
-                'طلب المساعدة الأكاديمية',
-                'تقليل الأنشطة الخارجية'
-            ],
-            'مقبول': [
-                'تحسين تقنيات الدراسة',
-                'زيادة ساعات المراجعة',
-                'المشاركة في الأنشطة الأكاديمية'
-            ],
-            'جيد': [
-                'التركيز على التميز في التخصص',
-                'المشاركة في البحث العلمي',
-                'تطوير المهارات القيادية'
-            ],
-            'جيد جداً': [
-                'الحفاظ على التميز',
-                'مساعدة الزملاء الآخرين',
-                'التحضير للدراسات العليا'
-            ],
-            'ممتاز': [
-                'الحفاظ على التميز المستمر',
-                'قيادة المشاريع الأكاديمية',
-                'التحضير للمنح الدراسية'
-            ]
-        }
-        
-        return actions_map.get(current_level, ['التطوير المستمر للمهارات'])
-    
-    def _generate_smart_plan(self, comprehensive_data, ai_analysis):
-        """توليد الخطة الذكية المخصصة"""
-        try:
-            # الخطة قصيرة المدى (الفصل الحالي والقادم)
-            short_term_plan = self._generate_short_term_plan(comprehensive_data, ai_analysis)
-            
-            # الخطة متوسطة المدى (السنة الأكاديمية)
-            medium_term_plan = self._generate_medium_term_plan(comprehensive_data, ai_analysis)
-            
-            # الخطة طويلة المدى (حتى التخرج)
-            long_term_plan = self._generate_long_term_plan(comprehensive_data, ai_analysis)
-            
-            # خطة الطوارئ
-            contingency_plan = self._generate_contingency_plan(comprehensive_data, ai_analysis)
-            
-            return {
-                'short_term': short_term_plan,
-                'medium_term': medium_term_plan,
-                'long_term': long_term_plan,
-                'contingency': contingency_plan,
-                'plan_summary': self._generate_plan_summary(
-                    short_term_plan, medium_term_plan, long_term_plan
-                )
-            }
-            
-        except Exception as e:
-            return {'error': f'خطأ في توليد الخطة الذكية: {str(e)}'}
-    
-    def _generate_short_term_plan(self, data, ai_analysis):
-        """توليد الخطة قصيرة المدى"""
-        plan = {
-            'timeframe': 'الفصل الحالي والقادم',
-            'priorities': [],
-            'actions': [],
-            'courses': [],
-            'goals': []
-        }
-        
-        # تحليل المخاطر الفورية
-        risk_analysis = ai_analysis.get('risk_analysis', {})
-        risk_level = risk_analysis.get('level', 'منخفض')
-        
-        if risk_level in ['عالي', 'عالي جداً']:
-            plan['priorities'].append('معالجة المخاطر الأكاديمية الفورية')
-            plan['actions'].extend(risk_analysis.get('mitigation_strategies', []))
-        
-        # تحليل الكفاءة الأكاديمية
-        efficiency = ai_analysis.get('efficiency_analysis', {})
-        improvement_areas = efficiency.get('improvement_areas', [])
-        plan['actions'].extend(improvement_areas)
-        
-        # أهداف قصيرة المدى
-        learning_patterns = ai_analysis.get('learning_patterns', {})
-        optimal_load = learning_patterns.get('optimal_study_load', {})
-        plan['goals'].append(f"تسجيل {optimal_load.get('recommended_credits', 15)} ساعة معتمدة")
-        
-        return plan
-    
-    def _generate_medium_term_plan(self, data, ai_analysis):
-        """توليد الخطة متوسطة المدى"""
-        plan = {
-            'timeframe': 'السنة الأكاديمية الحالية',
-            'priorities': [],
-            'actions': [],
-            'milestones': [],
-            'goals': []
-        }
-        
-        # تحليل التوافق المهني
-        career_alignment = ai_analysis.get('career_alignment', {})
-        career_development = career_alignment.get('career_development', [])
-        plan['actions'].extend(career_development)
-        
-        # معالم متوسطة المدى
-        path_data = data.get('basic_path', {})
-        current_semester = path_data.get('student_info', {}).get('current_semester', 1)
-        
-        if current_semester <= 4:
-            plan['milestones'].append('اختيار التشعيب النهائي')
-        elif current_semester <= 6:
-            plan['milestones'].append('التركيز على المقررات التخصصية')
-        else:
-            plan['milestones'].append('التحضير لمشروع التخرج')
-        
-        return plan
-    
-    def _generate_long_term_plan(self, data, ai_analysis):
-        """توليد الخطة طويلة المدى"""
-        plan = {
-            'timeframe': 'حتى التخرج والمستقبل المهني',
-            'priorities': [],
-            'actions': [],
-            'career_goals': [],
-            'graduation_strategy': []
-        }
-        
-        # استراتيجية التخرج
-        performance_prediction = ai_analysis.get('performance_prediction', {})
-        graduation_prediction = performance_prediction.get('graduation_prediction', '')
-        plan['graduation_strategy'].append(f'التخرج المتوقع: {graduation_prediction}')
-        
-        # الأهداف المهنية
-        career_alignment = ai_analysis.get('career_alignment', {})
-        career_prospects = career_alignment.get('current_path_prospects', {})
-        fields = career_prospects.get('fields', [])
-        plan['career_goals'].extend(fields[:3])  # أول 3 مجالات
-        
-        # الفرص والتهديدات
-        opportunities_threats = ai_analysis.get('opportunities_threats', {})
-        opportunities = opportunities_threats.get('opportunities', [])
-        plan['actions'].extend(opportunities)
-        
-        return plan
-    
-    def _generate_contingency_plan(self, data, ai_analysis):
-        """توليد خطة الطوارئ"""
-        plan = {
-            'risk_scenarios': [],
-            'mitigation_actions': [],
-            'alternative_paths': [],
-            'emergency_contacts': []
-        }
-        
-        # سيناريوهات المخاطر
-        risk_analysis = ai_analysis.get('risk_analysis', {})
-        risks = risk_analysis.get('risks', [])
-        plan['risk_scenarios'] = risks
-        
-        # إجراءات التخفيف
-        mitigation_strategies = risk_analysis.get('mitigation_strategies', [])
-        plan['mitigation_actions'] = mitigation_strategies
-        
-        # المسارات البديلة
-        division_recommendations = data.get('division_recommendations', {})
-        if division_recommendations and 'recommendations' in division_recommendations:
-            recommendations = division_recommendations['recommendations']
-            alternative_divisions = [rec for rec in recommendations if rec.get('suitability_score', 0) >= 60]
-            plan['alternative_paths'] = [div.get('division_name', '') for div in alternative_divisions[:3]]
-        
-        # جهات الاتصال في الطوارئ
-        plan['emergency_contacts'] = [
-            'المرشد الأكاديمي',
-            'شؤون الطلاب',
-            'عمادة الكلية'
-        ]
-        
-        return plan
-    
-    def _generate_plan_summary(self, short_term, medium_term, long_term):
-        """توليد ملخص الخطة"""
-        summary = {
-            'key_priorities': [],
-            'critical_actions': [],
-            'success_factors': [],
-            'timeline_overview': {}
-        }
-        
-        # الأولويات الرئيسية
-        summary['key_priorities'].extend(short_term.get('priorities', [])[:2])
-        summary['key_priorities'].extend(medium_term.get('priorities', [])[:2])
-        
-        # الإجراءات الحرجة
-        summary['critical_actions'].extend(short_term.get('actions', [])[:3])
-        summary['critical_actions'].extend(medium_term.get('actions', [])[:2])
-        
-        # عوامل النجاح
-        summary['success_factors'] = [
-            'الالتزام بالخطة الموضوعة',
-            'المتابعة الدورية مع المرشد الأكاديمي',
-            'التقييم المستمر للتقدم',
-            'المرونة في التكيف مع التغييرات'
-        ]
-        
-        # نظرة عامة على الجدول الزمني
-        summary['timeline_overview'] = {
-            'immediate': 'الفصل الحالي والقادم',
-            'short_term': 'السنة الأكاديمية الحالية',
-            'long_term': 'حتى التخرج والمستقبل المهني'
-        }
-        
-        return summary
-    
-    def _analyze_career_alignment(self, comprehensive_data):
-        """تحليل التوافق المهني"""
-        try:
-            path_data = comprehensive_data.get('basic_path', {})
-            division_recommendations = comprehensive_data.get('division_recommendations', {})
-            
-            current_path = path_data.get('current_path', {})
-            current_division = current_path.get('division_display_name', 'غير محدد')
-            
-            # تحليل التوافق مع المسار الحالي
-            alignment_score = 75  # نقطة بداية متوسطة
-            
-            # تحليل الأداء في المسار الحالي
-            progress = path_data.get('progress', {})
-            cumulative_gpa = progress.get('cumulative_gpa', {})
-            current_gpa = cumulative_gpa.get('current_cumulative', 0)
-            
-            if current_gpa >= 3.5:
-                alignment_score += 15
-            elif current_gpa >= 3.0:
-                alignment_score += 10
-            elif current_gpa < 2.5:
-                alignment_score -= 20
-            
-            # تحليل التوصيات المتاحة
-            career_recommendations = []
-            if division_recommendations and 'recommendations' in division_recommendations:
-                for rec in division_recommendations['recommendations'][:3]:
-                    career_recommendations.append({
-                        'division': rec.get('division_name', ''),
-                        'suitability': rec.get('recommendation_level', ''),
-                        'score': rec.get('suitability_score', 0)
-                    })
-            
-            return {
-                'current_alignment_score': min(100, max(0, alignment_score)),
-                'current_division': current_division,
-                'alignment_level': self._get_alignment_level(alignment_score),
-                'career_recommendations': career_recommendations,
-                'market_trends': self._get_market_trends(),
-                'skill_gaps': self._identify_skill_gaps(comprehensive_data)
-            }
-            
-        except Exception as e:
-            return {
-                'current_alignment_score': 0,
-                'current_division': 'غير محدد',
-                'alignment_level': 'غير محدد',
-                'career_recommendations': [],
-                'error': f'خطأ في تحليل التوافق المهني: {str(e)}'
-            }
-    
-    def _get_alignment_level(self, score):
-        """تحديد مستوى التوافق"""
-        if score >= 85:
-            return 'ممتاز'
-        elif score >= 70:
-            return 'جيد'
-        elif score >= 55:
-            return 'مقبول'
+
+    def _analyze_performance_trend(self, performance):
+        """تحليل اتجاه الأداء"""
+        if performance['overall_gpa'] >= 3.5:
+            return 'أداء ممتاز'
+        elif performance['overall_gpa'] >= 3.0:
+            return 'أداء جيد جداً'
+        elif performance['overall_gpa'] >= 2.5:
+            return 'أداء جيد'
+        elif performance['overall_gpa'] >= 2.0:
+            return 'أداء مقبول'
         else:
             return 'يحتاج تحسين'
-    
-    def _get_market_trends(self):
-        """الحصول على اتجاهات السوق"""
+
+    def _create_single_specialization_plan(self, student, specialization, start_semester, max_credits):
+        """إنشاء خطة لتخصص واحد"""
+        plan = {}
+        
+        for semester in range(start_semester + 1, 9):  # حتى الترم 8
+            semester_courses = self._get_specialization_courses(
+                student, specialization, semester, max_credits
+            )
+            plan[f'semester_{semester}'] = {
+                'semester_number': semester,
+                'semester_name': f'الترم {semester}',
+                'specialization': specialization,
+                'courses': semester_courses,
+                'total_credits': sum(course['credits'] for course in semester_courses)
+            }
+            
+        return plan
+
+    def _create_specialized_plan(self, student, current_semester, max_credits):
+        """إنشاء خطة للطالب المتخصص"""
+        plan = {}
+        current_specialization = student.division.Name
+        
+        for semester in range(current_semester + 1, 9):  # حتى الترم 8
+            semester_courses = self._get_specialization_courses(
+                student, current_specialization, semester, max_credits
+            )
+            plan[f'semester_{semester}'] = {
+                'semester_number': semester,
+                'semester_name': f'الترم {semester}',
+                'courses': semester_courses,
+                'total_credits': sum(course['credits'] for course in semester_courses)
+            }
+            
+        return plan
+
+    def _recommend_intermediate_specialization(self, student):
+        """اقتراح التشعيب المتوسط لمسار العلوم الطبيعية"""
+        performance = self._analyze_student_performance(student)
+        intermediate_options = ['الرياضيات والفيزياء', 'الكيمياء والفيزياء']
+        
+        recommendations = []
+        for option in intermediate_options:
+            score = self._calculate_intermediate_score(option, performance)
+            recommendations.append({
+                'specialization': option,
+                'suitability_score': score,
+                'recommendation_level': self._get_recommendation_level(score)
+            })
+            
+        recommendations.sort(key=lambda x: x['suitability_score'], reverse=True)
+        
         return {
-            'growing_fields': ['تقنية المعلومات', 'الذكاء الاصطناعي', 'علوم البيانات'],
-            'stable_fields': ['الطب', 'الهندسة', 'التعليم'],
-            'emerging_opportunities': ['الأمن السيبراني', 'الطاقة المتجددة', 'التكنولوجيا الحيوية']
+            'recommended': recommendations[0],
+            'all_options': recommendations
         }
-    
-    def _identify_skill_gaps(self, comprehensive_data):
-        """تحديد الفجوات في المهارات"""
-        return [
-            'مهارات التواصل',
-            'مهارات القيادة',
-            'مهارات تقنية متقدمة',
-            'مهارات البحث العلمي'
-        ]
-    
-    def _analyze_academic_efficiency(self, comprehensive_data):
-        """تحليل الكفاءة الأكاديمية"""
-        try:
-            path_data = comprehensive_data.get('basic_path', {})
-            progress = path_data.get('progress', {})
-            
-            # حساب الكفاءة بناءً على النسبة بين الساعات المكتملة والوقت المستغرق
-            current_semester = progress.get('current_semester', 1)
-            credits_completed = progress.get('credits_completed', 0)
-            
-            expected_credits = current_semester * 15  # متوسط 15 ساعة لكل فصل
-            efficiency_ratio = (credits_completed / expected_credits * 100) if expected_credits > 0 else 0
-            
-            efficiency_level = 'ممتاز' if efficiency_ratio >= 90 else \
-                             'جيد' if efficiency_ratio >= 75 else \
-                             'مقبول' if efficiency_ratio >= 60 else 'ضعيف'
-            
-            return {
-                'efficiency_ratio': round(efficiency_ratio, 2),
-                'efficiency_level': efficiency_level,
-                'credits_completed': credits_completed,
-                'expected_credits': expected_credits,
-                'improvement_suggestions': self._get_efficiency_suggestions(efficiency_ratio)
-            }
-            
-        except Exception as e:
-            return {
-                'efficiency_ratio': 0,
-                'efficiency_level': 'غير محدد',
-                'error': f'خطأ في تحليل الكفاءة: {str(e)}'
-            }
-    
-    def _get_efficiency_suggestions(self, efficiency_ratio):
-        """اقتراحات لتحسين الكفاءة"""
-        if efficiency_ratio < 60:
-            return [
-                'زيادة عدد الساعات المسجلة',
-                'تحسين إدارة الوقت',
-                'طلب المساعدة الأكاديمية'
-            ]
-        elif efficiency_ratio < 75:
-            return [
-                'تحسين استراتيجيات الدراسة',
-                'تنظيم الجدول الدراسي'
-            ]
-        else:
-            return [
-                'الحفاظ على الأداء الحالي',
-                'التفكير في ساعات إضافية'
-            ]
-    
-    def _predict_future_performance(self, comprehensive_data):
-        """التنبؤ بالأداء المستقبلي"""
-        try:
-            path_data = comprehensive_data.get('basic_path', {})
-            progress = path_data.get('progress', {})
-            cumulative_gpa = progress.get('cumulative_gpa', {})
-            
-            current_gpa = cumulative_gpa.get('current_cumulative', 0)
-            gpa_trend = cumulative_gpa.get('trend', 'مستقر')
-            
-            # التنبؤ بالمعدل التراكمي للفصل القادم
-            predicted_gpa = current_gpa
-            if gpa_trend == 'متحسن':
-                predicted_gpa += 0.2
-            elif gpa_trend == 'متراجع':
-                predicted_gpa -= 0.1
-            
-            predicted_gpa = min(4.0, max(0.0, predicted_gpa))
-            
-            # مستوى الثقة في التنبؤ
-            confidence_level = 80 if gpa_trend != 'مستقر' else 70
-            
-            return {
-                'predicted_next_gpa': round(predicted_gpa, 2),
-                'confidence_level': confidence_level,
-                'trend_direction': gpa_trend,
-                'performance_outlook': self._get_performance_outlook(predicted_gpa, gpa_trend)
-            }
-            
-        except Exception as e:
-            return {
-                'predicted_next_gpa': 0,
-                'confidence_level': 0,
-                'error': f'خطأ في التنبؤ بالأداء: {str(e)}'
-            }
-    
-    def _get_performance_outlook(self, predicted_gpa, trend):
-        """تحديد توقعات الأداء"""
-        if predicted_gpa >= 3.5:
-            return 'ممتاز - أداء متميز متوقع'
-        elif predicted_gpa >= 3.0:
-            return 'جيد - أداء مستقر متوقع'
-        elif predicted_gpa >= 2.5:
-            return 'مقبول - يحتاج تحسين'
-        else:
-            return 'ضعيف - يحتاج تدخل عاجل'
-    
-    def _analyze_opportunities_threats(self, comprehensive_data):
-        """تحليل الفرص والتهديدات"""
-        try:
-            path_data = comprehensive_data.get('basic_path', {})
-            progress = path_data.get('progress', {})
-            
-            opportunities = []
-            threats = []
-            
-            # تحليل الفرص
-            cumulative_gpa = progress.get('cumulative_gpa', {})
-            current_gpa = cumulative_gpa.get('current_cumulative', 0)
-            
-            if current_gpa >= 3.5:
-                opportunities.extend([
-                    'التقدم للمنح الدراسية',
-                    'الانضمام لبرامج التميز',
-                    'فرص البحث العلمي'
-                ])
-            
-            if current_gpa >= 3.0:
-                opportunities.extend([
-                    'التدريب في شركات مرموقة',
-                    'المشاركة في المؤتمرات العلمية'
-                ])
-            
-            # تحليل التهديدات
-            gpa_trend = cumulative_gpa.get('trend', 'مستقر')
-            if gpa_trend == 'متراجع':
-                threats.append('تراجع الأداء الأكاديمي')
-            
-            if current_gpa < 2.5:
-                threats.extend([
-                    'خطر الإنذار الأكاديمي',
-                    'صعوبة في الحصول على فرص تدريب'
-                ])
-            
-            return {
-                'opportunities': opportunities,
-                'threats': threats,
-                'strategic_recommendations': self._get_strategic_recommendations(opportunities, threats)
-            }
-            
-        except Exception as e:
-            return {
-                'opportunities': [],
-                'threats': [],
-                'error': f'خطأ في تحليل الفرص والتهديدات: {str(e)}'
-            }
-    
-    def _get_strategic_recommendations(self, opportunities, threats):
-        """التوصيات الاستراتيجية"""
+
+    def _calculate_intermediate_score(self, option, performance):
+        """حساب نقاط التشعيب المتوسط"""
+        if 'رياضيات' in option and 'فيزياء' in option:
+            return (performance['math_performance_avg'] * 0.5 + 
+                   performance['physics_performance_avg'] * 0.4 + 
+                   performance['overall_gpa'] * 0.1)
+        elif 'كيمياء' in option and 'فيزياء' in option:
+            return (performance['chemistry_performance_avg'] * 0.5 + 
+                   performance['physics_performance_avg'] * 0.4 + 
+                   performance['overall_gpa'] * 0.1)
+        return performance['overall_gpa']
+
+    def _recommend_final_specialization(self, student, current_specialization, options, performance):
+        """التوصية بالتخصص النهائي مع تحليل معمق"""
         recommendations = []
         
-        if opportunities:
-            recommendations.append('استغلال الفرص المتاحة لتطوير المسار المهني')
+        for option in options:
+            # حساب نقاط الملاءمة
+            suitability_score = self._calculate_final_score(option, performance)
+            
+            # التحليل المفصل
+            detailed_analysis = self._get_detailed_specialization_analysis(option, performance)
+            
+            # تحديد مستوى التوصية
+            confidence_level = "عالي" if suitability_score >= 3.5 else "متوسط" if suitability_score >= 3.0 else "منخفض"
+            
+            # الأسباب الرئيسية
+            key_reasons = []
+            if detailed_analysis['strengths']:
+                key_reasons.extend(detailed_analysis['strengths'][:2])  # أقوى نقطتين
+            if detailed_analysis['concerns']:
+                key_reasons.extend([f"⚠️ {concern}" for concern in detailed_analysis['concerns'][:1]])
+            
+            recommendation = {
+                'specialization': option,
+                'suitability_score': round(suitability_score, 2),
+                'confidence_level': confidence_level,
+                'key_reasons': key_reasons,
+                'detailed_analysis': detailed_analysis,
+                'recommendation_text': self._generate_recommendation_text(option, suitability_score, detailed_analysis)
+            }
+            
+            recommendations.append(recommendation)
+            
+        # ترتيب التوصيات حسب النقاط
+        recommendations.sort(key=lambda x: x['suitability_score'], reverse=True)
         
-        if threats:
-            recommendations.append('وضع خطة لمواجهة التحديات المحتملة')
+        # التوصية الذكية الرئيسية
+        top_recommendation = recommendations[0] if recommendations else None
         
-        recommendations.extend([
-            'التطوير المستمر للمهارات',
-            'بناء شبكة علاقات مهنية',
-            'المتابعة الدورية للأداء الأكاديمي'
-        ])
+        # تحليل الأداء العام
+        performance_summary = {
+            'overall_gpa': performance['overall_gpa'],
+            'strongest_subject': self._get_strongest_subject(performance),
+            'weakest_subject': self._get_weakest_subject(performance),
+            'academic_standing': self._get_academic_standing(performance['overall_gpa']),
+            'improvement_areas': self._get_improvement_areas(performance)
+        }
         
-        return recommendations
-    
-    def _calculate_overall_ai_score(self, learning_patterns, risk_analysis, career_alignment, efficiency_analysis, performance_prediction):
-        """حساب النقاط الإجمالية للذكاء الاصطناعي"""
+        return {
+            'smart_recommendation': {
+                'recommended_specialization': top_recommendation['specialization'] if top_recommendation else None,
+                'confidence_level': top_recommendation['confidence_level'] if top_recommendation else 'منخفض',
+                'reasoning': top_recommendation['recommendation_text'] if top_recommendation else 'لا توجد بيانات كافية للتوصية',
+                'suitability_score': top_recommendation['suitability_score'] if top_recommendation else 0,
+                'key_reasons': top_recommendation['key_reasons'] if top_recommendation else []
+            },
+            'performance_analysis': performance_summary,
+            'all_options': recommendations,
+            'alternative_options': recommendations[1:3] if len(recommendations) > 1 else []
+        }
+
+    def _generate_recommendation_text(self, specialization, score, analysis):
+        """توليد نص التوصية"""
+        if score >= 3.5:
+            strength_text = " و ".join(analysis['strengths'][:2]) if analysis['strengths'] else "أداء جيد"
+            return f"توصية قوية بـ{specialization} بناءً على {strength_text}. هذا التخصص يناسب قدراتك الأكاديمية بشكل ممتاز."
+        elif score >= 3.0:
+            return f"توصية جيدة بـ{specialization}. تظهر قدرات مناسبة لهذا التخصص مع بعض المجالات للتحسين."
+        elif score >= 2.5:
+            concern_text = analysis['concerns'][0] if analysis['concerns'] else "بعض التحديات"
+            return f"يمكن النظر في {specialization} ولكن مع الانتباه إلى {concern_text}. ينصح بالعمل على تحسين الأداء."
+        else:
+            return f"لا ينصح بـ{specialization} في الوقت الحالي. يفضل التركيز على تحسين الأداء الأكاديمي أولاً."
+
+    def _get_strongest_subject(self, performance):
+        """أقوى مادة للطالب"""
+        subjects = {
+            'الرياضيات': performance['math_performance_avg'],
+            'الفيزياء': performance['physics_performance_avg'],
+            'الكيمياء': performance['chemistry_performance_avg'],
+            'الأحياء': performance['biology_performance_avg'],
+            'الجيولوجيا': performance['geology_performance_avg'],
+            'علوم الحاسب': performance['computer_science_performance_avg']
+        }
+        
+        # تصفية المواد التي لها درجات
+        subjects_with_grades = {k: v for k, v in subjects.items() if v > 0}
+        
+        if subjects_with_grades:
+            strongest = max(subjects_with_grades, key=subjects_with_grades.get)
+            strongest_avg = subjects_with_grades[strongest]
+            return {
+                'subject': strongest,
+                'average': strongest_avg,
+                'performance_level': self._get_performance_level(strongest_avg)
+            }
+        else:
+            return {
+                'subject': 'غير محدد',
+                'average': 0.0,
+                'performance_level': 'لا توجد بيانات'
+            }
+
+    def _get_weakest_subject(self, performance):
+        """أضعف مادة للطالب"""
+        subjects = {
+            'الرياضيات': performance['math_performance_avg'],
+            'الفيزياء': performance['physics_performance_avg'],
+            'الكيمياء': performance['chemistry_performance_avg'],
+            'الأحياء': performance['biology_performance_avg'],
+            'الجيولوجيا': performance['geology_performance_avg'],
+            'علوم الحاسب': performance['computer_science_performance_avg']
+        }
+        
+        # تصفية المواد التي لها درجات
+        subjects_with_grades = {k: v for k, v in subjects.items() if v > 0}
+        
+        if subjects_with_grades:
+            weakest = min(subjects_with_grades, key=subjects_with_grades.get)
+            weakest_avg = subjects_with_grades[weakest]
+            return {
+                'subject': weakest,
+                'average': weakest_avg,
+                'performance_level': self._get_performance_level(weakest_avg)
+            }
+        else:
+            return {
+                'subject': 'غير محدد',
+                'average': 0.0,
+                'performance_level': 'لا توجد بيانات'
+            }
+
+    def _get_academic_standing(self, gpa):
+        """تحديد المستوى الأكاديمي"""
+        if gpa >= 3.75:
+            return 'ممتاز'
+        elif gpa >= 3.25:
+            return 'جيد جداً'
+        elif gpa >= 2.75:
+            return 'جيد'
+        elif gpa >= 2.0:
+            return 'مقبول'
+        else:
+            return 'ضعيف'
+
+    def _get_improvement_areas(self, performance):
+        """تحديد مجالات التحسين"""
+        areas = []
+        
+        if performance['math_performance_avg'] < 2.5:
+            areas.append('الرياضيات')
+        if performance['physics_performance_avg'] < 2.5:
+            areas.append('الفيزياء')
+        if performance['chemistry_performance_avg'] < 2.5:
+            areas.append('الكيمياء')
+        if performance['computer_science_performance_avg'] < 2.5 and performance['computer_science_performance_avg'] > 0:
+            areas.append('علوم الحاسب')
+            
+        return areas if areas else ['لا توجد مجالات محددة للتحسين']
+
+    def _get_valid_final_specializations(self, current_division):
+        """الحصول على التخصصات النهائية المتاحة حسب التشعيب المتوسط الحالي"""
+        
+        # قواعد التشعيب الكاملة حسب النظام المطلوب
+        division_rules = {
+            # مسار العلوم الطبيعية - التشعيب المتوسط
+            'الرياضيات والفيزياء': [
+                'الرياضيات الخاصة',
+                'الفيزياء الخاصة', 
+                'الرياضيات وعلوم الحاسب'
+            ],
+            
+            'الكيمياء والفيزياء': [
+                'الكيمياء الخاصة'
+            ]
+        }
+        
+        return division_rules.get(current_division, [])
+
+    def _calculate_final_score(self, option, performance):
+        """حساب نقاط التخصص النهائي"""
+        if 'رياضيات' in option:
+            return (performance['math_performance_avg'] * 0.7 + 
+                   performance['overall_gpa'] * 0.3)
+        elif 'فيزياء' in option:
+            return (performance['physics_performance_avg'] * 0.7 + 
+                   performance['overall_gpa'] * 0.3)
+        elif 'كيمياء' in option:
+            return (performance['chemistry_performance_avg'] * 0.7 + 
+                   performance['overall_gpa'] * 0.3)
+        return performance['overall_gpa']
+
+    def _get_detailed_specialization_analysis(self, specialization, performance):
+        """تحليل مفصل لملاءمة التخصص للطالب"""
+        analysis = {
+            'strengths': [],
+            'concerns': [],
+            'requirements': [],
+            'career_prospects': []
+        }
+        
+        # تحليل حسب التخصص
+        if 'رياضيات' in specialization:
+            math_avg = performance['math_performance_avg']
+            
+            if math_avg >= 3.5:
+                analysis['strengths'].append(f'أداء ممتاز في الرياضيات ({math_avg:.2f})')
+            elif math_avg >= 3.0:
+                analysis['strengths'].append(f'أداء جيد جداً في الرياضيات ({math_avg:.2f})')
+            elif math_avg >= 2.5:
+                analysis['strengths'].append(f'أداء جيد في الرياضيات ({math_avg:.2f})')
+            else:
+                analysis['concerns'].append(f'أداء ضعيف في الرياضيات ({math_avg:.2f})')
+            
+            analysis['requirements'] = [
+                'التفوق في مقررات التحليل الرياضي المتقدم',
+                'إتقان الجبر الخطي والمعادلات التفاضلية',
+                'مهارات قوية في الإثبات الرياضي'
+            ]
+            
+            if 'حاسب' in specialization:
+                cs_avg = performance['computer_science_performance_avg']
+                if cs_avg > 0:
+                    analysis['strengths'].append(f'خبرة في علوم الحاسب ({cs_avg:.2f})')
+                else:
+                    analysis['concerns'].append('لا توجد خبرة واضحة في علوم الحاسب')
+                    
+                analysis['career_prospects'] = [
+                    'مطور برمجيات',
+                    'محلل بيانات',
+                    'باحث في الذكاء الاصطناعي',
+                    'مدرس رياضيات وحاسوب'
+                ]
+            else:
+                analysis['career_prospects'] = [
+                    'مدرس رياضيات',
+                    'باحث أكاديمي',
+                    'محلل إحصائي',
+                    'أخصائي تطوير المناهج'
+                ]
+                
+        elif 'فيزياء' in specialization:
+            physics_avg = performance['physics_performance_avg']
+            math_avg = performance['math_performance_avg']
+            
+            if physics_avg >= 3.0:
+                analysis['strengths'].append(f'أداء قوي في الفيزياء ({physics_avg:.2f})')
+            else:
+                analysis['concerns'].append(f'أداء ضعيف في الفيزياء ({physics_avg:.2f})')
+                
+            if math_avg >= 3.0:
+                analysis['strengths'].append(f'أساس رياضي قوي يدعم الفيزياء ({math_avg:.2f})')
+            else:
+                analysis['concerns'].append('الرياضيات ضرورية لفهم الفيزياء المتقدمة')
+            
+            analysis['requirements'] = [
+                'فهم عميق للميكانيكا الكلاسيكية والكمية',
+                'مهارات رياضية متقدمة',
+                'قدرة على التجريب والقياس الدقيق'
+            ]
+            
+            analysis['career_prospects'] = [
+                'باحث في الفيزياء',
+                'مدرس فيزياء',
+                'عالم في مختبرات البحث',
+                'مطور تقنيات علمية'
+            ]
+            
+        elif 'كيمياء' in specialization:
+            chemistry_avg = performance['chemistry_performance_avg']
+            math_avg = performance['math_performance_avg']
+            
+            if chemistry_avg >= 3.0:
+                analysis['strengths'].append(f'أداء قوي في الكيمياء ({chemistry_avg:.2f})')
+            else:
+                analysis['concerns'].append(f'أداء ضعيف في الكيمياء ({chemistry_avg:.2f})')
+                
+            if math_avg >= 2.5:
+                analysis['strengths'].append('أساس رياضي مناسب للكيمياء')
+            
+            analysis['requirements'] = [
+                'فهم عميق للكيمياء العضوية وغير العضوية',
+                'مهارات مختبرية متقدمة',
+                'فهم الكيمياء الفيزيائية والتحليلية'
+            ]
+            
+            analysis['career_prospects'] = [
+                'كيميائي في الصناعة',
+                'باحث في المختبرات',
+                'مدرس كيمياء',
+                'محلل كيميائي'
+            ]
+        
+        # تحليل المعدل العام
+        overall_gpa = performance['overall_gpa']
+        if overall_gpa >= 3.5:
+            analysis['strengths'].append(f'معدل تراكمي ممتاز ({overall_gpa:.2f})')
+        elif overall_gpa >= 3.0:
+            analysis['strengths'].append(f'معدل تراكمي جيد جداً ({overall_gpa:.2f})')
+        elif overall_gpa >= 2.5:
+            analysis['strengths'].append(f'معدل تراكمي جيد ({overall_gpa:.2f})')
+        else:
+            analysis['concerns'].append(f'معدل تراكمي منخفض ({overall_gpa:.2f}) - يحتاج تحسين')
+        
+        return analysis
+
+    def _create_intermediate_specialization_plans(self, student, options, current_semester, max_credits):
+        """إنشاء خطط للتشعيبات المتوسطة"""
+        plans = {}
+        
+        for option in options:
+            plans[option] = self._create_single_specialization_plan(
+                student, option, current_semester, max_credits
+            )
+            
+        return plans
+
+    def _create_final_specialization_plans(self, student, options, current_semester, max_credits):
+        """إنشاء خطط للتخصصات النهائية"""
+        plans = {}
+        
+        for option in options:
+            plans[option] = self._create_single_specialization_plan(
+                student, option, current_semester, max_credits
+            )
+            
+        return plans
+
+    def _get_available_courses_for_division(self, division_id):
+        """الحصول على المقررات المتاحة للشعبة مع معلومات القسم - محسن"""
+        return self._get_all_division_data_bulk(division_id)
+
+    def _get_courses_by_department(self, department_name):
+        """الحصول على جميع المقررات لقسم معين"""
+        courses = Courses.query.join(Departments).filter(
+            Departments.Name.like(f'%{department_name}%')
+        ).all()
+        
+        course_list = []
+        for course in courses:
+            course_list.append({
+                'course_id': course.Id,
+                'name': course.Name,
+                'code': course.Code,
+                'credits': course.Credits,
+                'semester': course.Semester,
+                'description': course.Description,
+                'department_name': course.department.Name
+            })
+            
+        return course_list
+
+    def _get_specialization_related_courses(self, student, specialization):
+        """الحصول على المقررات المرتبطة بتخصص معين - محسن"""
+        available_courses = self._get_available_courses_for_division(student.DivisionId)
+        completed_courses = self._get_completed_course_ids(student.Id)
+        
+        # تصفية المقررات حسب التخصص - معالجة محسنة
+        relevant_courses = []
+        
+        for course in available_courses:
+            if course['course_id'] in completed_courses:
+                continue
+                
+            # تحديد إذا كان المقرر متعلق بالتخصص
+            is_relevant = self._is_course_relevant_to_specialization(course, specialization)
+            
+            if is_relevant:
+                course['relevance_score'] = self._calculate_course_relevance_score(course, specialization)
+                relevant_courses.append(course)
+        
+        # ترتيب المقررات حسب الأهمية
+        relevant_courses.sort(key=lambda x: (x['is_mandatory'], x['relevance_score']), reverse=True)
+        
+        return relevant_courses
+
+    def _is_course_relevant_to_specialization(self, course, specialization):
+        """تحديد إذا كان المقرر متعلق بالتخصص"""
+        course_subject = course['subject_type']
+        department_name = course['department_name'].lower()
+        course_name = course['name'].lower()
+        
+        if 'حيوان' in specialization:
+            return course_subject == 'biology' or 'حيوان' in course_name or 'zoology' in course_name
+        elif 'نبات' in specialization:
+            return course_subject in ['biology', 'chemistry'] or 'نبات' in course_name or 'botany' in course_name
+        elif 'كيمياء' in specialization:
+            return course_subject == 'chemistry' or 'كيمياء' in course_name
+        elif 'جيولوج' in specialization:
+            return course_subject in ['geology', 'chemistry'] or 'جيولوج' in course_name
+        elif 'رياضيات' in specialization:
+            return course_subject in ['math', 'computer_science'] or 'رياض' in course_name
+        elif 'فيزياء' in specialization:
+            return course_subject in ['physics', 'math'] or 'فيزياء' in course_name
+        
+        return False
+
+    def _calculate_course_relevance_score(self, course, specialization):
+        """حساب نقاط صلة المقرر بالتخصص"""
+        score = 0
+        course_subject = course['subject_type']
+        
+        # النقاط الأساسية حسب نوع المادة
+        if 'حيوان' in specialization and course_subject == 'biology':
+            score += 10
+        elif 'كيمياء' in specialization and course_subject == 'chemistry':
+            score += 10
+        elif 'رياضيات' in specialization and course_subject == 'math':
+            score += 10
+        elif 'فيزياء' in specialization and course_subject == 'physics':
+            score += 10
+        elif 'جيولوج' in specialization and course_subject == 'geology':
+            score += 10
+        
+        # نقاط إضافية للمقررات الإجبارية
+        if course['is_mandatory']:
+            score += 5
+        
+        # نقاط إضافية حسب الترم (المقررات المبكرة أولوية)
+        if course['semester'] <= 4:
+            score += 3
+        elif course['semester'] <= 6:
+            score += 2
+        else:
+            score += 1
+            
+        return score
+
+    def _get_specialization_courses(self, student, specialization, semester, max_credits):
+        """الحصول على مقررات تخصص معين محسنة"""
+        # الحصول على المقررات المرتبطة بالتخصص
+        relevant_courses = self._get_specialization_related_courses(student, specialization)
+        
+        # تصفية المقررات حسب الترم
+        semester_courses = [
+            course for course in relevant_courses 
+            if course['semester'] == semester
+        ]
+        
+        # إذا لم توجد مقررات للترم المحدد، اختيار من الترمات المتاحة
+        if not semester_courses:
+            semester_courses = [
+                course for course in relevant_courses 
+                if course['semester'] >= semester  # الترمات اللاحقة
+            ]
+        
+        # اختيار المقررات بناءً على حد الساعات
+        selected_courses = []
+        total_credits = 0
+        
+        # إعطاء أولوية للمقررات الإجبارية ذات الصلة العالية
+        mandatory_courses = [c for c in semester_courses if c['is_mandatory']]
+        elective_courses = [c for c in semester_courses if not c['is_mandatory']]
+        
+        # إضافة المقررات الإجبارية أولاً
+        for course in mandatory_courses:
+            if total_credits + course['credits'] <= max_credits:
+                selected_courses.append(course)
+                total_credits += course['credits']
+                
+        # إضافة المقررات الاختيارية حسب الأهمية
+        for course in elective_courses:
+            if total_credits + course['credits'] <= max_credits and len(selected_courses) < 6:
+                selected_courses.append(course)
+                total_credits += course['credits']
+                
+        # إذا لم نصل للحد الأقصى، إضافة مقررات عامة
+        if total_credits < max_credits:
+            general_courses = self._get_general_backup_courses(student, semester, max_credits - total_credits)
+            for course in general_courses:
+                if course['course_id'] not in [c['course_id'] for c in selected_courses]:
+                    if total_credits + course['credits'] <= max_credits and len(selected_courses) < 6:
+                        selected_courses.append(course)
+                        total_credits += course['credits']
+                
+        return selected_courses
+
+    def _get_general_backup_courses(self, student, semester, remaining_credits):
+        """الحصول على مقررات عامة احتياطية مع البيانات الكاملة - محسن"""
+        available_courses = self._get_available_courses_for_division(student.DivisionId)
+        completed_courses = self._get_completed_course_ids(student.Id)
+        
+        # تصفية المقررات غير المكتملة
+        backup_courses = []
+        
+        for course_data in available_courses:
+            if course_data['course_id'] not in completed_courses and course_data['credits'] <= remaining_credits:
+                # الحصول على بيانات المقرر الكاملة من قاعدة البيانات
+                course = Courses.query.get(course_data['course_id'])
+                if course:
+                    backup_courses.append({
+                        'course_id': course.Id,
+                        'course_name': course.Name,
+                        'course_code': course.Code,
+                        'credits': course.Credits,
+                        'is_mandatory': course_data['is_mandatory'],
+                        'semester': course_data['semester']
+                    })
+        
+        # ترتيب حسب الأهمية (إجباري أولاً، ثم حسب الترم)
+        backup_courses.sort(key=lambda x: (not x['is_mandatory'], x['semester']))
+        
+        # إزالة الحقول الإضافية وإرجاع البيانات النظيفة
+        clean_courses = []
+        for course in backup_courses[:3]:  # أقصى 3 مقررات احتياطية
+            clean_courses.append({
+                'course_id': course['course_id'],
+                'course_name': course['course_name'],
+                'course_code': course['course_code'],
+                'credits': course['credits']
+            })
+        
+        return clean_courses
+
+    def _get_completed_course_ids(self, student_id):
+        """الحصول على قائمة بمعرفات المقررات المكتملة - محسن"""
+        student_data = self._get_student_data_bulk(student_id)
+        if student_data:
+            return self._get_completed_course_ids_fast(student_data['enrollments'])
+        return []
+
+    def _calculate_course_ratio(self, courses):
+        """حساب نسبة المقررات الإجبارية للاختيارية"""
+        mandatory_count = len([c for c in courses if c['is_mandatory']])
+        elective_count = len([c for c in courses if not c['is_mandatory']])
+        
+        return {
+            'mandatory': mandatory_count,
+            'elective': elective_count,
+            'ratio': f"{mandatory_count}:{elective_count}" if elective_count > 0 else f"{mandatory_count}:0"
+        }
+
+    def _error_response(self, message):
+        """إنشاء استجابة خطأ موحدة"""
+        return {
+            'message': message,
+            'status': 'error'
+        }
+
+    def get_division_recommendations(self, student_id):
+        """الحصول على توصيات التخصص للطالب"""
+        from models import Students
+        
         try:
-            scores = []
+            student = Students.query.get(student_id)
+            if not student:
+                return self._error_response('الطالب غير موجود')
             
-            # نقاط من تحليل أنماط التعلم
-            if learning_patterns.get('learning_efficiency', 0) > 0:
-                scores.append(learning_patterns['learning_efficiency'])
+            # تحديد المرحلة الحالية للطالب
+            current_stage = self._determine_student_stage(student)
             
-            # نقاط من تحليل المخاطر (عكسي)
-            risk_level = risk_analysis.get('level', 'متوسط')
-            risk_score = {'منخفض': 90, 'متوسط': 70, 'عالي': 40, 'عالي جداً': 20}.get(risk_level, 50)
-            scores.append(risk_score)
-            
-            # نقاط من التوافق المهني
-            if career_alignment.get('current_alignment_score', 0) > 0:
-                scores.append(career_alignment['current_alignment_score'])
-            
-            # نقاط من الكفاءة الأكاديمية
-            if efficiency_analysis.get('efficiency_ratio', 0) > 0:
-                scores.append(min(100, efficiency_analysis['efficiency_ratio']))
-            
-            # نقاط من التنبؤ بالأداء
-            confidence = performance_prediction.get('confidence_level', 0)
-            if confidence > 0:
-                scores.append(confidence)
-            
-            overall_score = sum(scores) / len(scores) if scores else 0
+            # الحصول على التوصيات المناسبة حسب المرحلة
+            recommendations = self._get_stage_appropriate_recommendations(student, current_stage)
             
             return {
-                'score': round(overall_score, 2),
-                'level': 'ممتاز' if overall_score >= 85 else 'جيد' if overall_score >= 70 else 'مقبول' if overall_score >= 55 else 'يحتاج تحسين',
-                'components': {
-                    'learning_patterns': learning_patterns.get('learning_efficiency', 0),
-                    'risk_management': risk_score,
-                    'career_alignment': career_alignment.get('current_alignment_score', 0),
-                    'academic_efficiency': efficiency_analysis.get('efficiency_ratio', 0),
-                    'prediction_confidence': confidence
-                }
+                'message': 'تم الحصول على توصيات التخصص بنجاح',
+                'status': 'success',
+                    'student_info': self._get_basic_student_info(student),
+                    'current_stage': current_stage,
+                    'recommendations': recommendations
             }
             
         except Exception as e:
+            return self._error_response(f'خطأ في الحصول على التوصيات: {str(e)}')
+
+    def _determine_student_stage(self, student):
+        """تحديد المرحلة الحالية للطالب بناءً على الفصل الدراسي والشعبة"""
+        current_division = student.division.Name
+        semester = student.Semester
+        
+        # العام الأول - جميع المسارات
+        if semester <= 2:
+            if current_division == 'مجموعة العلوم الطبيعية':
+                return 'العام الأول - مسار العلوم الطبيعية'
+            elif current_division == 'مجموعة العلوم البيولوجية والكيميائية':
+                return 'العام الأول - مسار العلوم البيولوجية'
+            elif current_division == 'مجموعة العلوم الجيولوجية والكيميائية':
+                return 'العام الأول - مسار العلوم الجيولوجية'
+        
+        # العام الثاني
+        elif semester <= 4:
+            if current_division == 'مجموعة العلوم الطبيعية':
+                return 'العام الثاني - يحتاج اختيار تشعيب متوسط'
+            elif current_division in ['الرياضيات والفيزياء', 'الكيمياء والفيزياء']:
+                return f'العام الثاني - التشعيب المتوسط: {current_division}'
+            elif current_division == 'مجموعة العلوم البيولوجية والكيميائية':
+                return 'العام الثاني - مسار العلوم البيولوجية'
+            elif current_division == 'مجموعة العلوم الجيولوجية والكيميائية':
+                return 'العام الثاني - مسار العلوم الجيولوجية'
+        
+        # العام الثالث والرابع
+        else:
+            if current_division in ['الرياضيات والفيزياء', 'الكيمياء والفيزياء']:
+                return f'العام الثالث/الرابع - يحتاج اختيار تخصص نهائي من {current_division}'
+            elif current_division == 'مجموعة العلوم البيولوجية والكيميائية':
+                return 'العام الثالث/الرابع - يحتاج اختيار تخصص نهائي من البيولوجية'
+            elif current_division == 'مجموعة العلوم الجيولوجية والكيميائية':
+                return 'العام الثالث/الرابع - يحتاج اختيار تخصص نهائي من الجيولوجية'
+            else:
+                # طالب في تخصص نهائي بالفعل
+                return f'التخصص النهائي: {current_division}'
+        
+        return 'مرحلة غير محددة'
+
+    def _get_stage_appropriate_recommendations(self, student, current_stage):
+        """الحصول على التوصيات المناسبة حسب مرحلة الطالب مع تحليل الأداء"""
+        current_division = student.division.Name
+        
+        # العام الأول - لا يحتاج توصيات تخصص
+        if 'العام الأول' in current_stage:
             return {
-                'score': 0,
-                'level': 'غير محدد',
-                'error': f'خطأ في حساب النقاط: {str(e)}'
+                'note': 'الطالب في العام الأول، سيتم اختيار التخصص في السنوات اللاحقة',
+                'next_step': self._get_next_step_recommendation(current_division)
             }
+        
+        # العام الثاني - اختيار التشعيب المتوسط لمسار العلوم الطبيعية
+        elif 'يحتاج اختيار تشعيب متوسط' in current_stage:
+            return self._recommend_intermediate_specialization(student)
+        
+        # العام الثالث/الرابع - اختيار التخصص النهائي
+        elif 'يحتاج اختيار تخصص نهائي' in current_stage:
+            performance = self._analyze_student_performance(student)
+            
+            # تحديد التخصصات المتاحة حسب المسار
+            available_specializations = []
+            if 'البيولوجية' in current_stage:
+                available_specializations = [
+                    'علم الحيوان',
+                    'النبات والكيمياء', 
+                    'علم الحيوان والكيمياء',
+                    'الكيمياء والكيمياء الحيوية'
+                ]
+            elif 'الجيولوجية' in current_stage:
+                available_specializations = ['الجيولوجيا والكيمياء']
+            
+            if not available_specializations:
+                return {
+                    'note': 'لا توجد تخصصات متاحة',
+                    'error': 'خطأ في تحديد التخصصات المتاحة'
+                }
+            
+            return self._recommend_final_specialization(
+                student, current_division, available_specializations, performance
+            )
+        
+        # طالب في تشعيب متوسط - هنا المشكلة اللي كنت بتتكلمي عليها
+        elif 'التشعيب المتوسط' in current_stage:
+            # تحليل أداء الطالب في التشعيب المتوسط
+            performance = self._analyze_student_performance(student)
+            available_specializations = self._get_valid_final_specializations(current_division)
+            
+            if not available_specializations:
+                return {
+                    'note': f'لا توجد تخصصات متاحة للتشعيب: {current_division}',
+                    'error': 'خطأ في النظام'
+                }
+            
+            # حساب التوصية الذكية بناءً على الأداء
+            specialization_recommendation = self._recommend_specialization(
+                student, available_specializations, performance
+            )
+            
+            return {
+                'current_status': f'الطالب في التشعيب المتوسط: {current_division}',
+                'smart_recommendation': {
+                    'recommended_specialization': specialization_recommendation['recommended_specialization']['specialization'],
+                    'confidence_level': specialization_recommendation['recommended_specialization']['recommendation_level'],
+                    'reasoning': self._format_reasoning_with_calculation(
+                        specialization_recommendation['recommended_specialization']['reasoning'],
+                        performance
+                    ),
+                    'suitability_score': specialization_recommendation['recommended_specialization']['suitability_score']
+                },
+                'alternative_options': [
+                    {
+                        'specialization': rec['specialization'],
+                        'suitability_score': rec['suitability_score'],
+                        'recommendation_level': rec['recommendation_level'],
+                        'brief_reasoning': self._format_reasoning_with_calculation(rec['reasoning'][:2], performance)
+                    }
+                    for rec in specialization_recommendation['all_recommendations'][1:]  # باقي الخيارات
+                ],
+                'next_step': 'يُنصح بالتقديم للتخصص الموصى به في العام الثالث',
+                'note': f'التوصية مبنية على تحليل أدائك الأكاديمي (المعدل التراكمي: {performance["overall_gpa"]})'
+            }
+        
+        # طالب في تخصص نهائي
+        elif 'التخصص النهائي' in current_stage:
+            return {
+                'current_status': f'الطالب في التخصص النهائي: {current_division}',
+                'note': 'التخصص مكتمل - التركيز على الأداء الأكاديمي والتحضير للتخرج'
+            }
+        
+        return {'note': 'لا توجد توصيات متاحة حالياً'}
+
+    def _format_reasoning_with_calculation(self, reasons, performance):
+        """تنسيق الأسباب بشكل مبسط وواضح"""
+        formatted_reasons = []
+        
+        for reason in reasons:
+            # تبسيط النصوص بدون تكرار أو تفاصيل زائدة
+            if 'رياضيات' in reason and 'متوسط' in reason:
+                math_avg = performance['math_performance_avg']
+                formatted_reason = f"أداء جيد في الرياضيات: {math_avg}"
+            elif 'فيزياء' in reason and 'متوسط' in reason:
+                physics_avg = performance['physics_performance_avg']
+                formatted_reason = f"أداء مناسب في الفيزياء: {physics_avg}"
+            elif 'كيمياء' in reason and 'متوسط' in reason:
+                chemistry_avg = performance['chemistry_performance_avg']
+                formatted_reason = f"أداء في الكيمياء: {chemistry_avg}"
+            elif 'معدل تراكمي' in reason:
+                formatted_reason = f"المعدل التراكمي العام: {performance['overall_gpa']}"
+            else:
+                # الاحتفاظ بالأسباب الأخرى بشكل مبسط
+                formatted_reason = reason.replace('/4.0', '').replace('محسوب من', '').replace('مقررات', '').replace('مقرر', '')
+                # تنظيف النص من الأقواس والتفاصيل الزائدة
+                formatted_reason = formatted_reason.split('(')[0].strip()
+                
+            formatted_reasons.append(formatted_reason)
+        
+        # إزالة التكرارات
+        unique_reasons = []
+        for reason in formatted_reasons:
+            if reason not in unique_reasons:
+                unique_reasons.append(reason)
+            
+        return unique_reasons
+
+    def _get_next_step_recommendation(self, current_division):
+        """تحديد الخطوة التالية للطالب"""
+        if current_division == 'مجموعة العلوم الطبيعية':
+            return 'في العام الثاني يجب اختيار تشعيب متوسط: الرياضيات والفيزياء أو الكيمياء والفيزياء'
+        elif current_division == 'مجموعة العلوم البيولوجية والكيميائية':
+            return 'في العام الثالث يجب اختيار تخصص نهائي من التخصصات البيولوجية'
+        elif current_division == 'مجموعة العلوم الجيولوجية والكيميائية':
+            return 'في العام الثالث يجب اختيار تخصص: الجيولوجيا والكيمياء'
+        return 'غير محدد'
+
+    def _get_final_year_advice(self, student, performance):
+        """نصائح أكاديمية للطلاب في السنة النهائية"""
+        advice = []
+        current_gpa = performance['overall_gpa']
+        current_semester = student.Semester
+        
+        # نصائح حسب المعدل
+        if current_gpa >= 3.5:
+            advice.append('أداء ممتاز! استمر على نفس المستوى')
+            advice.append('فكر في التقديم لبرامج الدراسات العليا')
+        elif current_gpa >= 3.0:
+            advice.append('أداء جيد جداً، حاول الحفاظ على المعدل أو تحسينه')
+            advice.append('يمكنك التقديم لبرامج الدراسات العليا')
+        elif current_gpa >= 2.5:
+            advice.append('أداء جيد، ركز على المواد الأساسية في تخصصك')
+            advice.append('حاول تحسين المعدل في الترمات المتبقية')
+        elif current_gpa >= 2.0:
+            advice.append('تحتاج لبذل جهد إضافي لتحسين المعدل')
+            advice.append('ركز على اجتياز جميع المواد بدرجات مقبولة')
+        else:
+            advice.append('وضع أكاديمي حرج - تحتاج مساعدة فورية')
+            advice.append('تواصل مع المرشد الأكاديمي لوضع خطة علاجية')
+        
+        # نصائح حسب الترم
+        if current_semester >= 7:
+            advice.append('قارب على التخرج - تأكد من استكمال جميع متطلبات التخصص')
+            advice.append('ابدأ التحضير لمشروع التخرج إن وجد')
+        
+        # نصائح حسب أقوى وأضعف المواد
+        strongest = self._get_strongest_subject(performance)
+        weakest = self._get_weakest_subject(performance)
+        
+        if strongest['subject'] != 'غير محدد':
+            advice.append(f'نقطة قوتك في {strongest["subject"]} - استغلها في مشاريعك')
+        
+        if weakest['subject'] != 'غير محدد' and weakest['average'] < 2.5:
+            advice.append(f'تحتاج تحسين في {weakest["subject"]} - اطلب مساعدة إضافية')
+            
+        return advice
+
+    def get_course_schedule(self, student_id, semester_count=None):
+        """الحصول على الخطة الدراسية الذكية حسب مرحلة الطالب"""
+        try:
+            from models import Students
+            
+            # الحصول على بيانات الطالب
+            student = Students.query.get(student_id)
+            if not student:
+                return self._error_response('الطالب غير موجود')
+            
+            # تحديد المرحلة والتخصص الحالي
+            current_stage = self._determine_student_stage(student)
+            current_semester = student.Semester
+            current_gpa = self._calculate_student_gpa(student)
+            max_credits = self._get_max_credits(current_gpa)
+            
+            student_info = {
+                'id': student.Id,
+                'name': student.Name,
+                'current_semester': current_semester,
+                'division': student.division.Name if student.division else 'غير محدد',
+                'credits_completed': student.CreditsCompleted,
+                'gpa': current_gpa,
+                'max_credits_per_semester': max_credits
+            }
+            
+            # إنشاء الخطة حسب المرحلة
+            if 'العام الأول' in current_stage or 'مجموعة العلوم الطبيعية' in current_stage:
+                # طالب في المرحلة العامة
+                return self._create_general_student_plan(student, student_info, current_stage)
+                
+            elif 'آخر ترم قبل التخصص' in current_stage or current_semester == 2:
+                # طالب علوم طبيعية في الترم الثاني - يحتاج خطط متعددة
+                return self._create_pre_specialization_plans(student, student_info)
+                
+            elif 'التشعيب المتوسط' in current_stage or current_semester == 4:
+                # طالب في الترم الرابع - يحتاج خطط متعددة للتخصصات النهائية
+                return self._create_intermediate_stage_plans(student, student_info, current_stage)
+                
+            elif 'التخصص النهائي' in current_stage or current_semester >= 5:
+                # طالب في التخصص النهائي - خطة واحدة لباقي الترمات
+                return self._create_final_stage_plan(student, student_info, current_stage)
+                
+            else:
+                return self._error_response('لا يمكن تحديد المرحلة الدراسية للطالب')
+                
+        except Exception as e:
+            return self._error_response(f'خطأ في إنشاء الخطة الدراسية: {str(e)}')
+
+    def _create_general_student_plan(self, student, student_info, current_stage):
+        """إنشاء خطة دراسية للطلاب في المرحلة العامة"""
+        current_semester = student.Semester
+        max_credits = student_info['max_credits_per_semester']
+        
+        # تحديد عدد الترمات المتبقية في المرحلة العامة
+        if 'مجموعة العلوم الطبيعية' in current_stage:
+            remaining_semesters = 2 - current_semester  # ترمين في العلوم الطبيعية
+        else:
+            remaining_semesters = 4 - current_semester  # أربع ترمات في البيولوجية/الجيولوجية
+        
+        if remaining_semesters <= 0:
+            return self._error_response('الطالب انتهى من المرحلة العامة')
+        
+        semester_plans = {}
+        
+        for i in range(remaining_semesters):
+            semester_number = current_semester + i + 1
+            semester_key = f'semester_{semester_number}'
+            
+            # الحصول على المقررات للترم
+            courses = self._get_general_courses_for_semester(student, semester_number, max_credits)
+            
+            semester_plans[semester_key] = {
+                'semester_number': semester_number,
+                'semester_name': f'الترم {semester_number}',
+                'stage': 'المرحلة العامة',
+                'courses': courses,
+                'total_credits': sum(course.get('credits', 0) for course in courses),
+                'note': 'مقررات عامة - لا يوجد تخصص بعد'
+            }
+            
+            return {
+            'student_info': student_info,
+            'plan_type': 'المرحلة العامة',
+            'current_stage': current_stage,
+            'remaining_semesters': remaining_semesters,
+            'semester_plans': semester_plans,
+            'note': 'خطة دراسية للمرحلة العامة - سيتم اختيار التخصص لاحقاً'
+        }
+
+    def _create_pre_specialization_plans(self, student, student_info):
+        """إنشاء خطط متعددة للطلاب قبل اختيار التخصص المتوسط"""
+        # الحصول على التوصيات من division-recommendations
+        recommendations = self.get_division_recommendations(student.Id)
+        
+        if 'error' in recommendations:
+            return self._error_response('خطأ في الحصول على التوصيات')
+        
+        recommended_path = None
+        alternative_path = None
+        
+        # استخراج المسار الموصى به والمسار البديل
+        if 'smart_recommendation' in recommendations.get('data', {}):
+            recommended_spec = recommendations['data']['smart_recommendation']['recommended_specialization']
+            recommended_path = recommended_spec
+            
+            # الحصول على المسار البديل
+            alternatives = recommendations['data'].get('alternative_options', [])
+            if alternatives:
+                alternative_path = alternatives[0]['specialization']
+        
+        # إنشاء خطط متعددة
+        plans = {}
+        
+        if recommended_path:
+            plans['recommended_plan'] = self._create_specialization_path_plan(
+                student, student_info, recommended_path, 'المسار الموصى به'
+            )
+        
+        if alternative_path:
+            plans['alternative_plan'] = self._create_specialization_path_plan(
+                student, student_info, alternative_path, 'المسار البديل'
+            )
+        
+        return {
+            'student_info': student_info,
+            'plan_type': 'خطط متعددة قبل التخصص المتوسط',
+            'current_stage': 'آخر ترم قبل التخصص المتوسط',
+            'available_plans': plans,
+            'recommendation': f'يُنصح بالمسار: {recommended_path}' if recommended_path else 'لا توجد توصية محددة',
+            'note': 'اختر المسار المناسب لك بناءً على أدائك وتوصيات النظام'
+        }
+
+    def _create_intermediate_stage_plans(self, student, student_info, current_stage):
+        """إنشاء خطط متعددة للطلاب في التشعيب المتوسط"""
+        current_division = student.division.Name if student.division else 'غير محدد'
+        
+        # الحصول على التخصصات النهائية المتاحة
+        available_specializations = self._get_valid_final_specializations(current_division)
+        
+        if not available_specializations:
+            return self._error_response(f'لا توجد تخصصات نهائية متاحة للتشعيب: {current_division}')
+        
+        # الحصول على التوصيات
+        recommendations = self.get_division_recommendations(student.Id)
+        recommended_spec = None
+        
+        if 'smart_recommendation' in recommendations.get('data', {}):
+            recommended_spec = recommendations['data']['smart_recommendation']['recommended_specialization']
+        
+        # إنشاء خطط لكل التخصصات المتاحة
+        plans = {}
+        
+        for specialization in available_specializations:
+            plan_type = 'المسار الموصى به' if specialization == recommended_spec else 'مسار بديل'
+            plans[f'plan_{specialization.lower().replace(" ", "_")}'] = self._create_final_specialization_path_plan(
+                student, student_info, specialization, plan_type
+            )
+            
+        return {
+            'student_info': student_info,
+            'plan_type': 'خطط متعددة للتخصصات النهائية',
+            'current_stage': current_stage,
+            'available_plans': plans,
+            'recommendation': f'يُنصح بالتخصص: {recommended_spec}' if recommended_spec else 'لا توجد توصية محددة',
+            'note': 'اختر التخصص النهائي المناسب لك بناءً على أدائك وأهدافك المهنية'
+        }
+
+    def _create_final_stage_plan(self, student, student_info, current_stage):
+        """إنشاء خطة دراسية للطلاب في التخصص النهائي"""
+        current_semester = student.Semester
+        current_specialization = student.division.Name if student.division else 'غير محدد'
+        max_credits = student_info['max_credits_per_semester']
+        
+        # حساب الترمات المتبقية للتخرج
+        total_semesters = 8
+        remaining_semesters = total_semesters - current_semester
+        
+        semester_plans = {}
+        
+        # إنشاء خطط للترمات المتبقية
+        for i in range(remaining_semesters):
+            semester_number = current_semester + i + 1
+            semester_key = f'semester_{semester_number}'
+            
+            # الحصول على مقررات التخصص للترم
+            courses = self._get_specialization_courses_for_semester(
+                student, current_specialization, semester_number, max_credits
+            )
+            
+            semester_plans[semester_key] = {
+                'semester_number': semester_number,
+                'semester_name': f'الترم {semester_number}',
+                'stage': f'التخصص النهائي: {current_specialization}',
+                'courses': courses,
+                'total_credits': sum(course.get('credits', 0) for course in courses),
+                'note': f'مقررات تخصص {current_specialization}'
+            }
+        
+        # إضافة ملاحظة خاصة للترم الأخير
+        if remaining_semesters > 0:
+            last_semester_key = f'semester_{current_semester + remaining_semesters}'
+            if last_semester_key in semester_plans:
+                semester_plans[last_semester_key]['note'] += ' - ترم التخرج'
+                semester_plans[last_semester_key]['graduation_note'] = 'تأكد من استكمال جميع متطلبات التخرج'
+        
+        return {
+            'student_info': student_info,
+            'plan_type': f'خطة التخصص النهائي: {current_specialization}',
+            'current_stage': current_stage,
+            'remaining_semesters': remaining_semesters,
+            'semester_plans': semester_plans,
+            'graduation_info': {
+                'expected_graduation_semester': current_semester + remaining_semesters,
+                'total_semesters_to_complete': remaining_semesters,
+                'note': 'تأكد من اجتياز جميع المقررات المطلوبة للتخرج'
+            }
+        }
+
+    def _create_specialization_path_plan(self, student, student_info, specialization, plan_type):
+        """إنشاء خطة دراسية لمسار تخصص معين"""
+        current_semester = student.Semester
+        max_credits = student_info['max_credits_per_semester']
+        
+        # إنشاء خطة للترمات القادمة في هذا المسار
+        semester_plans = {}
+        
+        # بدء من الترم التالي
+        for i in range(6):  # 6 ترمات متبقية من الترم 3 إلى 8
+            semester_number = current_semester + i + 1
+            if semester_number > 8:
+                break
+                
+            semester_key = f'semester_{semester_number}'
+            
+            if semester_number <= 4:
+                # ترمات التشعيب المتوسط
+                courses = self._get_intermediate_specialization_courses(
+                    student, specialization, semester_number, max_credits
+                )
+                stage_name = f'التشعيب المتوسط: {specialization}'
+            else:
+                # ترمات التخصص النهائي
+                final_specs = self._get_valid_final_specializations(specialization)
+                if final_specs:
+                    recommended_final = final_specs[0]  # أول تخصص متاح
+                    courses = self._get_specialization_courses_for_semester(
+                        student, recommended_final, semester_number, max_credits
+                    )
+                    stage_name = f'التخصص النهائي: {recommended_final}'
+                else:
+                    courses = []
+                    stage_name = 'غير محدد'
+            
+            semester_plans[semester_key] = {
+                'semester_number': semester_number,
+                'semester_name': f'الترم {semester_number}',
+                'stage': stage_name,
+                'courses': courses,
+                'total_credits': sum(course.get('credits', 0) for course in courses),
+                'note': f'مقررات {plan_type}'
+            }
+        
+        return {
+            'specialization': specialization,
+            'plan_type': plan_type,
+            'semester_plans': semester_plans,
+            'total_semesters': len(semester_plans)
+        }
+
+    def _create_final_specialization_path_plan(self, student, student_info, specialization, plan_type):
+        """إنشاء خطة دراسية للتخصص النهائي"""
+        current_semester = student.Semester
+        max_credits = student_info['max_credits_per_semester']
+        
+        # الحصول على جميع المقررات المتاحة مرة واحدة
+        student_data = self._get_student_data_bulk(student.Id)
+        completed_course_ids = self._get_completed_course_ids_fast(student_data['enrollments'])
+        available_courses = self._get_all_division_data_bulk(student.DivisionId)
+        
+        # تصفية المقررات حسب التخصص
+        specialization_courses = self._filter_specialization_courses_fast(available_courses, specialization)
+        if not specialization_courses:
+            specialization_courses = available_courses
+        
+        # تتبع المقررات المقترحة لتجنب التكرار
+        suggested_course_ids = set()
+        semester_plans = {}
+        
+        # بدء من الترم التالي (5 إلى 8)
+        for i in range(4):  # 4 ترمات للتخصص النهائي
+            semester_number = current_semester + i + 1
+            if semester_number > 8:
+                break
+                
+            semester_key = f'semester_{semester_number}'
+            
+            courses = self._get_specialization_courses_for_specific_semester(
+                specialization_courses, completed_course_ids, suggested_course_ids, 
+                semester_number, max_credits, specialization
+            )
+            
+            # إضافة المقررات المقترحة إلى مجموعة التتبع
+            for course in courses:
+                if course.get('course_id'):
+                    suggested_course_ids.add(course['course_id'])
+            
+            semester_plans[semester_key] = {
+                'semester_number': semester_number,
+                'semester_name': f'الترم {semester_number}',
+                'stage': f'التخصص النهائي: {specialization}',
+                'courses': courses,
+                'total_credits': sum(course.get('credits', 0) for course in courses),
+                'note': f'مقررات التخصص النهائي - {plan_type}'
+            }
+        
+        return {
+            'specialization': specialization,
+            'plan_type': plan_type,
+            'semester_plans': semester_plans,
+            'total_semesters': len(semester_plans)
+        }
+
+    def _get_specialization_courses_for_specific_semester(self, available_courses, completed_course_ids, 
+                                                         suggested_course_ids, semester_number, max_credits, specialization):
+        """الحصول على مقررات مخصصة لترم معين مع تجنب التكرار"""
+        try:
+            # تقسيم المقررات حسب الأولوية والترم
+            high_priority_courses = []
+            medium_priority_courses = []
+            low_priority_courses = []
+            
+            for course_data in available_courses:
+                course_id = course_data.get('course_id')
+                
+                # تخطي المقررات المكتملة أو المقترحة مسبقاً
+                if (course_id in completed_course_ids or 
+                    course_id in suggested_course_ids):
+                    continue
+                
+                course_semester = course_data.get('semester', 1)
+                is_mandatory = course_data.get('is_mandatory', False)
+                
+                # تصنيف المقررات حسب الأولوية والترم
+                if is_mandatory and course_semester <= semester_number:
+                    high_priority_courses.append(course_data)
+                elif (course_semester == semester_number or 
+                      course_semester == semester_number - 1):
+                    medium_priority_courses.append(course_data)
+                elif self._is_course_relevant_to_specialization_fast(course_data, specialization):
+                    medium_priority_courses.append(course_data)
+                else:
+                    low_priority_courses.append(course_data)
+            
+            # ترتيب كل مجموعة حسب معايير مختلفة
+            high_priority_courses.sort(key=lambda x: (x.get('semester', 99), -x.get('credits', 0)))
+            medium_priority_courses.sort(key=lambda x: (
+                not self._is_course_relevant_to_specialization_fast(x, specialization),
+                x.get('semester', 99), 
+                -x.get('credits', 0)
+            ))
+            low_priority_courses.sort(key=lambda x: (x.get('semester', 99), -x.get('credits', 0)))
+            
+            # بناء قائمة المقررات النهائية
+            selected_courses = []
+            current_credits = 0
+            
+            # أولاً: المقررات عالية الأولوية
+            for course_data in high_priority_courses:
+                if current_credits >= max_credits:
+                    break
+                course = self._format_course_data(course_data)
+                if current_credits + course['credits'] <= max_credits:
+                    selected_courses.append(course)
+                    current_credits += course['credits']
+            
+            # ثانياً: المقررات متوسطة الأولوية
+            for course_data in medium_priority_courses:
+                if current_credits >= max_credits:
+                    break
+                course = self._format_course_data(course_data)
+                if current_credits + course['credits'] <= max_credits:
+                    selected_courses.append(course)
+                    current_credits += course['credits']
+            
+            # ثالثاً: المقررات منخفضة الأولوية إذا لم نصل للحد الأقصى
+            for course_data in low_priority_courses:
+                if current_credits >= max_credits or len(selected_courses) >= 7:
+                    break
+                course = self._format_course_data(course_data)
+                if current_credits + course['credits'] <= max_credits:
+                    selected_courses.append(course)
+                    current_credits += course['credits']
+            
+            # ضمان الحد الأدنى من المقررات
+            if len(selected_courses) == 0:
+                # كملجأ أخير، خذ أي مقررات متاحة
+                fallback_courses = [c for c in available_courses 
+                                  if (c.get('course_id') not in completed_course_ids and 
+                                      c.get('course_id') not in suggested_course_ids)][:4]
+                
+                for course_data in fallback_courses:
+                    selected_courses.append(self._format_course_data(course_data))
+            
+            return selected_courses[:7]  # حد أقصى 7 مقررات
+            
+        except Exception as e:
+            return [{'error': f'خطأ في جلب المقررات للترم {semester_number}: {str(e)}'}]
+
+    def _format_course_data(self, course_data):
+        """تنسيق بيانات المقرر بصيغة موحدة"""
+        return {
+            'course_id': course_data.get('course_id'),
+            'course_name': course_data.get('name', 'مقرر غير محدد'),
+            'course_code': course_data.get('code', 'غير محدد'),
+            'credits': course_data.get('credits', 3),
+            'department': course_data.get('department_name', 'غير محدد'),
+            'is_mandatory': course_data.get('is_mandatory', False)
+        }
+
+    def _get_specialization_courses_for_semester(self, student, specialization, semester, max_credits):
+        """الحصول على مقررات التخصص لترم معين مع البيانات الكاملة - محسن"""
+        try:
+            # استخدام البيانات المحملة مسبقاً
+            student_data = self._get_student_data_bulk(student.Id)
+            completed_course_ids = self._get_completed_course_ids_fast(student_data['enrollments'])
+            
+            # الحصول على مقررات الشعبة من الكاش
+            available_courses = self._get_all_division_data_bulk(student.DivisionId)
+            
+            # تصفية المقررات حسب التخصص أولاً
+            specialization_courses = self._filter_specialization_courses_fast(available_courses, specialization)
+            
+            # إذا لم نجد مقررات متخصصة، استخدم المقررات العامة للشعبة
+            if not specialization_courses:
+                specialization_courses = available_courses
+            
+            # استخدام دالة التحديد المحسنة للمقررات
+            empty_suggested = set()  # لا توجد مقررات مقترحة مسبقاً في هذا السياق
+            
+            filtered_courses = self._get_specialization_courses_for_specific_semester(
+                specialization_courses, completed_course_ids, empty_suggested, 
+                semester, max_credits, specialization
+            )
+            
+            return filtered_courses
+            
+        except Exception as e:
+            # في حالة الخطأ، أرجع قائمة فارغة مع رسالة
+            return [{'error': f'خطأ في جلب المقررات: {str(e)}'}]
+
+    def _filter_specialization_courses_fast(self, available_courses, specialization):
+        """تصفية مقررات التخصص بسرعة من البيانات المحملة"""
+        relevant_courses = []
+        
+        # تعريف كلمات مفتاحية أكثر تفصيلاً لكل تخصص
+        specialization_detailed_keywords = {
+            'الرياضيات الخاصة': {
+                'primary': ['رياضيات', 'حساب', 'جبر', 'هندسة', 'إحصاء', 'تفاضل', 'تكامل'],
+                'secondary': ['منطق', 'نظرية', 'خطي'],
+                'departments': ['قسم الرياضيات']
+            },
+            'الفيزياء الخاصة': {
+                'primary': ['فيزياء', 'ميكانيكا', 'كهرباء', 'مغناطيس', 'بصريات', 'ضوء'],
+                'secondary': ['طاقة', 'حركة', 'موجات', 'ذرية'],
+                'departments': ['قسم الفيزياء']
+            },
+            'الرياضيات وعلوم الحاسب': {
+                'primary': ['رياضيات', 'حاسب', 'برمجة', 'خوارزميات', 'بيانات'],
+                'secondary': ['منطق', 'نظم', 'تحليل', 'تصميم'],
+                'departments': ['قسم الرياضيات', 'قسم علوم الحاسب']
+            },
+            'الأحياء': {
+                'primary': ['أحياء', 'حيوان', 'نبات', 'خلية', 'جزيئي'],
+                'secondary': ['وراثة', 'تطور', 'بيئة', 'تشريح'],
+                'departments': ['قسم علم الحيوان', 'قسم النبات']
+            },
+            'الكيمياء': {
+                'primary': ['كيمياء', 'تحليلي', 'عضوي', 'فيزيائي'],
+                'secondary': ['معادن', 'تفاعل', 'محلول', 'تركيب'],
+                'departments': ['قسم الكيمياء']
+            },
+            'الجيولوجيا': {
+                'primary': ['جيولوجيا', 'معادن', 'صخور', 'أرض'],
+                'secondary': ['طبقات', 'حفريات', 'بترول', 'مياه'],
+                'departments': ['قسم الجيولوجيا']
+            }
+        }
+        
+        # الحصول على كلمات التخصص
+        spec_keywords = specialization_detailed_keywords.get(specialization, {
+            'primary': [specialization.lower()],
+            'secondary': [],
+            'departments': []
+        })
+        
+        for course in available_courses:
+            relevance_score = 0
+            course_name = course.get('name', '').lower()
+            department_name = course.get('department_name', '').lower()
+            
+            # فحص الكلمات الأساسية
+            for keyword in spec_keywords['primary']:
+                if keyword in course_name:
+                    relevance_score += 10
+                if keyword in department_name:
+                    relevance_score += 5
+            
+            # فحص الكلمات الثانوية
+            for keyword in spec_keywords['secondary']:
+                if keyword in course_name:
+                    relevance_score += 3
+                if keyword in department_name:
+                    relevance_score += 2
+            
+            # فحص القسم
+            for dept in spec_keywords['departments']:
+                if dept.lower() in department_name:
+                    relevance_score += 8
+            
+            # إضافة درجة للمقررات الإجبارية
+            if course.get('is_mandatory', False):
+                relevance_score += 15
+            
+            # إضافة المقرر إذا كان ذا صلة
+            if relevance_score > 0:
+                course['relevance_score'] = relevance_score
+                relevant_courses.append(course)
+        
+        # إذا لم نجد مقررات مرتبطة، أرجع جميع المقررات مع درجات منخفضة
+        if not relevant_courses:
+            for course in available_courses:
+                course['relevance_score'] = 1 if course.get('is_mandatory', False) else 0.5
+                relevant_courses.append(course)
+        
+        # ترتيب حسب الأهمية والصلة
+        relevant_courses.sort(key=lambda x: (
+            -x.get('relevance_score', 0),  # الأكثر صلة أولاً
+            -int(x.get('is_mandatory', False)),  # الإجباري أولاً
+            x.get('semester', 99)  # الترم الأقل أولاً
+        ))
+        
+        return relevant_courses
+
+    def _is_course_relevant_to_specialization_fast(self, course, specialization):
+        """تحديد صلة المقرر بالتخصص - سريع"""
+        course_name = course.get('name', '').lower()
+        department_name = course.get('department_name', '').lower()
+        
+        # قواعد تحديد الصلة - محسنة
+        specialization_keywords = {
+            'الأحياء': ['أحياء', 'حيوان', 'نبات', 'جزيئي', 'خلوي'],
+            'الكيمياء': ['كيمياء', 'تحليلي', 'عضوي', 'فيزيائي'],
+            'الفيزياء': ['فيزياء', 'ميكانيكا', 'كهرباء', 'مغناطيس'],
+            'الرياضيات': ['رياضيات', 'حساب', 'جبر', 'هندسة'],
+            'الجيولوجيا': ['جيولوجيا', 'معادن', 'صخور', 'أرض']
+        }
+        
+        keywords = specialization_keywords.get(specialization, [])
+        return any(keyword in course_name or keyword in department_name for keyword in keywords)
+
+    def _calculate_course_relevance_score_fast(self, course, specialization):
+        """حساب درجة صلة المقرر بالتخصص - سريع"""
+        score = 0
+        
+        # الدرجات الأساسية
+        if course.get('is_mandatory', False):
+            score += 10
+        
+        # درجة التطابق مع التخصص
+        if self._is_course_relevant_to_specialization_fast(course, specialization):
+            score += 5
+        
+        # عوامل إضافية
+        if course.get('semester', 0) <= 6:  # مقررات الترمات المبكرة لها أولوية
+            score += 2
+        
+        return score
+
+    def _get_fast_backup_courses(self, available_courses, completed_course_ids, remaining_credits):
+        """الحصول على مقررات احتياطية بسرعة - محسن"""
+        backup_courses = []
+        
+        # ترتيب المقررات المتاحة حسب الأولوية
+        sorted_courses = sorted(
+            available_courses,
+            key=lambda x: (
+                not x.get('is_mandatory', False),  # إجباري أولاً
+                x.get('semester', 99),  # ثم حسب الترم
+                x.get('credits', 0)     # ثم حسب الساعات
+            )
+        )
+        
+        current_remaining = remaining_credits
+        
+        for course_data in sorted_courses:
+            if len(backup_courses) >= 5:  # حد أقصى 5 مقررات احتياطية
+                break
+                
+            course_id = course_data.get('course_id')
+            course_credits = course_data.get('credits', 3)  # قيمة افتراضية 3 ساعات
+            
+            if (course_id not in completed_course_ids and 
+                course_credits <= current_remaining):
+                
+                backup_courses.append({
+                    'course_id': course_id,
+                    'course_name': course_data.get('name', 'مقرر غير محدد'),
+                    'course_code': course_data.get('code', 'غير محدد'),
+                    'credits': course_credits,
+                    'department': course_data.get('department_name', 'غير محدد'),
+                    'is_mandatory': course_data.get('is_mandatory', False)
+                })
+                current_remaining -= course_credits
+        
+        # إذا لم نجد مقررات كافية، أضف بعض المقررات بدون تحديد الساعات
+        if len(backup_courses) < 3:
+            for course_data in sorted_courses:
+                if len(backup_courses) >= 5:
+                    break
+                    
+                course_id = course_data.get('course_id')
+                if course_id not in completed_course_ids:
+                    # تحقق من أن المقرر ليس موجود بالفعل
+                    existing_ids = [c.get('course_id') for c in backup_courses]
+                    if course_id not in existing_ids:
+                        backup_courses.append({
+                            'course_id': course_id,
+                            'course_name': course_data.get('name', 'مقرر غير محدد'),
+                            'course_code': course_data.get('code', 'غير محدد'),
+                            'credits': min(course_data.get('credits', 3), 4),  # حد أقصى 4 ساعات
+                            'department': course_data.get('department_name', 'غير محدد'),
+                            'is_mandatory': course_data.get('is_mandatory', False)
+                        })
+        
+        return backup_courses
+
+    def _get_intermediate_specialization_courses(self, student, specialization, semester, max_credits):
+        """الحصول على مقررات التشعيب المتوسط مع البيانات الكاملة"""
+        from models import Courses
+        
+        try:
+            # الحصول على المقررات المكتملة للطالب
+            completed_course_ids = self._get_completed_course_ids(student.Id)
+            
+            # الحصول على المقررات العامة للترم
+            courses = self._get_courses_for_semester(student, semester, max_credits)
+            
+            filtered_courses = []
+            current_credits = 0
+            
+            for course_data in courses:
+                if current_credits >= max_credits:
+                    break
+                    
+                course_id = course_data.get('course_id') if isinstance(course_data, dict) else getattr(course_data, 'CourseID', None)
+                
+                if course_id and course_id not in completed_course_ids:
+                    course = Courses.query.get(course_id)
+                    if course:
+                        course_credits = course.Credits
+                        if current_credits + course_credits <= max_credits:
+                            filtered_courses.append({
+                                'course_id': course.Id,
+                                'course_name': course.Name,
+                                'course_code': course.Code,
+                                'credits': course_credits
+                            })
+                            current_credits += course_credits
+            
+            return filtered_courses
+            
+        except Exception as e:
+            return []
+
+    def analyze_student_performance(self, student_id):
+        """تحليل شامل لأداء الطالب الأكاديمي"""
+        from models import Students
+        
+        try:
+            student = Students.query.get(student_id)
+            if not student:
+                return self._error_response('الطالب غير موجود')
+                
+            performance = self._analyze_student_performance(student)
+            current_stage = self._determine_student_stage(student)
+            
+            return {
+                'message': 'تم تحليل أداء الطالب بنجاح',
+                'status': 'success',
+                'student_info': self._get_basic_student_info(student),
+                'performance_analysis': performance,
+                'current_stage': current_stage,
+                'academic_standing': self._get_academic_standing(performance['overall_gpa']),
+                'recommendations': self._get_performance_recommendations(performance)
+            }
+            
+        except Exception as e:
+            return self._error_response(f'خطأ في تحليل الأداء: {str(e)}')
