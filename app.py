@@ -2,15 +2,16 @@ from flask import Flask, jsonify
 from flask_cors import CORS
 from flask_restful import Api
 from extensions import db, socketio, scheduler
+from resourses import * 
+from services import * 
+from scheduler import * 
 import signal
 import sys
 import urllib.parse
 import os
 import logging
-import atexit
-from resources import *
-from services import *
-from scheduler import *
+
+
 # إعداد التسجيل
 logging.basicConfig(
     level=logging.INFO,
@@ -48,18 +49,7 @@ def create_app(config_name='default'):
     
     @app.route('/health')
     def health_check():
-        return jsonify({'status': 'healthy', 'message': 'Student Affairs System is running'}), 200
-    
-    @app.route('/')
-    def home():
-        return jsonify({
-            'message': 'نظام شؤون الطلاب - Student Affairs System',
-            'status': 'running',
-            'endpoints': {
-                'health': '/health',
-                'docs': '/api'
-            }
-        }), 200
+        return jsonify({'status': 'healthy'}), 200
     
     app.config['JSON_AS_ASCII'] = False
     
@@ -68,6 +58,9 @@ def create_app(config_name='default'):
     app.config['SCHEDULER_DAEMON'] = False  
        
     db.init_app(app)
+    
+   
+    
     socketio.init_app(app, 
                      cors_allowed_origins="*",
                      async_mode='threading',  
@@ -75,6 +68,8 @@ def create_app(config_name='default'):
     scheduler.init_app(app)
     
     api = Api(app)
+    
+  
     
     # Enrollment Period
     api.add_resource(EnrollmentPeriodResource, '/api/enrollment-periods')
@@ -106,6 +101,9 @@ def create_app(config_name='default'):
     api.add_resource(StudentWarningCheckResource, '/api/academic-warnings/check/<int:student_id>')
     api.add_resource(StudentWarningResolveResource, '/api/academic-warnings/resolve/<int:student_id>')
 
+
+
+
     # Academic Status Analysis
     api.add_resource(AcademicStatusAnalysisResource, '/api/academic-status-analysis/<int:student_id>')
     api.add_resource(StudentBasicInfoResource, '/api/academic-status/basic-info/<int:student_id>')
@@ -120,29 +118,51 @@ def create_app(config_name='default'):
     api.add_resource(InterventionsResource, '/api/academic-status/interventions/<int:student_id>')
     api.add_resource(AIInsightsResource, '/api/academic-status/ai-insights/<int:student_id>')
 
-    # Academic Path Planning
+    # Academic Path Planning - التخطيط الأكاديمي المطور
     api.add_resource(AcademicPathPlanningResource, '/api/academic-path-planning/<int:student_id>')
-    api.add_resource(PathRecommendationResource, '/api/path-recommendations/<int:student_id>')
-    api.add_resource(StudentPathProgressResource, '/api/path-progress/<int:student_id>')
-    api.add_resource(PathValidationResource, '/api/path-validation/<int:student_id>')
-    api.add_resource(DivisionTransitionResource, '/api/division-transition/<int:student_id>')
-
-    # Very Smart Academic Path Planning - AI Enhanced
-    api.add_resource(VerySmartAcademicPathPlanningResource, '/api/very-smart-academic-planning/<int:student_id>')
-    api.add_resource(SmartPathAnalysisResource, '/api/smart-path-analysis/<int:student_id>')
-    api.add_resource(AcademicSmartRecommendationsResource, '/api/academic-smart-recommendations/<int:student_id>')
-    api.add_resource(StudentPerformancePredictionResource, '/api/performance-prediction/<int:student_id>')
+    api.add_resource(DivisionRecommendationResource, '/api/division-recommendations/<int:student_id>')
+    api.add_resource(CourseScheduleResource, '/api/course-schedule/<int:student_id>')
+    api.add_resource(StudentPerformanceAnalysisResource, '/api/student-performance-analysis/<int:student_id>')
 
     # إعداد مجدول الإنذارات الأكاديمية
-    try:
-        warning_scheduler = AcademicWarningScheduler(scheduler)  
-        warning_scheduler.setup_jobs()
-        scheduler.start()
-        logger.info("تم تشغيل مجدول الإنذارات الأكاديمية بنجاح")
-    except Exception as e:
-        logger.error(f"خطأ في تشغيل المجدول: {str(e)}")
+    warning_scheduler = AcademicWarningScheduler(scheduler)
+    warning_scheduler.setup_jobs()
 
-    # إعداد قاعدة البيانات
+
+
+
+
+
+
+
+    
+    logger.info("تم إنشاء التطبيق بنجاح")
+    return app  
+
+app = create_app()
+
+def cleanup_resources():
+    with app.app_context():
+        try:
+            scheduler.shutdown()
+            db.session.remove()
+            db.engine.dispose()
+            logger.info("cleaned up")
+        except Exception as e:
+            logger.error(f'Error during cleanup: {str(e)}')
+    
+def signal_handler(sig, frame):
+    logger.info('تم استلام إشارة إنهاء. جاري إغلاق التطبيق...')
+    cleanup_resources()
+    sys.exit(0)
+
+signal.signal(signal.SIGINT, signal_handler)
+signal.signal(signal.SIGTERM, signal_handler)
+
+if __name__ == '__main__':
+    port = int(os.environ.get("PORT", 5000))
+    logger.info(f"بدء تشغيل نظام شؤون الطلاب على المنفذ {port}")
+    
     with app.app_context():
         try:
             db.create_all()
@@ -150,39 +170,7 @@ def create_app(config_name='default'):
         except Exception as e:
             logger.error(f"خطأ في إنشاء جداول قاعدة البيانات: {str(e)}")
     
-    logger.info("تم إنشاء التطبيق بنجاح")
-    return app  
-
-# إنشاء التطبيق
-app = create_app()
-
-def cleanup_resources():
-    """تنظيف الموارد عند إغلاق التطبيق"""
-    try:
-        if scheduler.running:
-            scheduler.shutdown()
-        db.session.remove()
-        db.engine.dispose()
-        logger.info("تم تنظيف الموارد بنجاح")
-    except Exception as e:
-        logger.error(f'خطأ أثناء تنظيف الموارد: {str(e)}')
-
-def signal_handler(sig, frame):
-    """معالج إشارات النظام"""
-    logger.info('تم استلام إشارة إنهاء. جاري إغلاق التطبيق...')
-    cleanup_resources()
-    sys.exit(0)
-
-# تسجيل معالجات الإشارات
-signal.signal(signal.SIGINT, signal_handler)
-signal.signal(signal.SIGTERM, signal_handler)
-atexit.register(cleanup_resources)
-
-if __name__ == '__main__':
-    # للتشغيل المحلي فقط
-    port = int(os.environ.get("PORT", 5000))
-    logger.info(f"بدء تشغيل نظام شؤون الطلاب على المنفذ {port}")
-    
+    scheduler.start()
     try:
         socketio.run(app, debug=False, use_reloader=False, host="0.0.0.0", port=port)
     except KeyboardInterrupt:
